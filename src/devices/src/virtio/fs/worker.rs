@@ -20,6 +20,7 @@ use super::super::{FsError, Queue};
 use super::augment_fs::AugmentFs;
 use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
+use super::external::{External, ExternalFs};
 use super::inode_alloc::InodeAllocator;
 use super::null_fs::NullFs;
 use super::passthrough::{self, PassthroughFs};
@@ -32,6 +33,7 @@ enum FsServer {
     ReadWrite(Server<AugmentFs<PassthroughFs>>),
     ReadOnly(Server<AugmentFs<PassthroughFsRo>>),
     Null(Server<AugmentFs<NullFs>>),
+    External(Server<External>),
 }
 
 impl FsServer {
@@ -72,6 +74,15 @@ impl FsServer {
                 #[cfg(target_os = "macos")]
                 map_sender,
             ),
+            FsServer::External(s) => s.handle_message(
+                r,
+                w,
+                allow_idmap,
+                shm_region,
+                exit_code,
+                #[cfg(target_os = "macos")]
+                map_sender,
+            ),
         }
     }
 }
@@ -102,13 +113,15 @@ impl FsWorker {
         passthrough_cfg: Option<passthrough::Config>,
         read_only: bool,
         virtual_entries: Vec<VirtualDirEntry<'static>>,
+        external: Option<Arc<dyn ExternalFs>>,
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
     ) -> Result<Self, io::Error> {
         let inode_alloc = Arc::new(InodeAllocator::new());
-        let server = match passthrough_cfg {
-            Some(cfg) if read_only => {
+        let server = match (external, passthrough_cfg) {
+            (Some(fs), _) => FsServer::External(Server::new(External(fs))),
+            (None, Some(cfg)) if read_only => {
                 let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;
                 FsServer::ReadOnly(Server::new(AugmentFs::new(
                     inner,
@@ -116,7 +129,7 @@ impl FsWorker {
                     virtual_entries,
                 )))
             }
-            Some(cfg) => {
+            (None, Some(cfg)) => {
                 let inner = PassthroughFs::new(cfg, inode_alloc.clone())?;
                 FsServer::ReadWrite(Server::new(AugmentFs::new(
                     inner,
@@ -124,7 +137,7 @@ impl FsWorker {
                     virtual_entries,
                 )))
             }
-            None => FsServer::Null(Server::new(AugmentFs::new(
+            (None, None) => FsServer::Null(Server::new(AugmentFs::new(
                 NullFs,
                 &inode_alloc,
                 virtual_entries,

@@ -1,5 +1,6 @@
 mod augment_fs;
 mod device;
+mod external;
 #[allow(dead_code)]
 mod filesystem;
 pub mod fuse;
@@ -36,6 +37,7 @@ use super::descriptor_utils;
 
 pub use self::defs::uapi::VIRTIO_ID_FS as TYPE_FS;
 pub use self::device::Fs;
+pub use self::external::{ExternalAttr, ExternalEntry, ExternalFs};
 pub use self::filesystem::ExportTable;
 
 mod defs {

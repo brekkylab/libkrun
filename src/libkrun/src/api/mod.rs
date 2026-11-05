@@ -57,6 +57,8 @@ pub use devices::virtio::TsiPolicy;
 pub use devices::virtio::balloon::FreePageReportingMode;
 #[cfg(feature = "blk")]
 pub use devices::virtio::block::{DiskFormat, SyncMode};
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub use devices::virtio::fs::{ExternalAttr, ExternalEntry, ExternalFs};
 pub use error::VmmError;
 pub use logging::{LogLevel, LogOptions, LogStyle, init_log};
 pub use payload::{KernelFormat, Payload};

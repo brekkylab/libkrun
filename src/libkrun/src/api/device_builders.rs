@@ -33,6 +33,8 @@ use devices::virtio::balloon::FreePageReportingMode;
 #[cfg(feature = "blk")]
 use devices::virtio::block::{DiskFormat, SyncMode};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+use devices::virtio::fs::ExternalFs;
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::passthrough::PermissionSemantics;
@@ -662,6 +664,13 @@ impl<'a> FsDevice<'a> {
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 impl<'a> FsDevice<'a> {
+    /// A read-only virtiofs device serving `fs` rather than a host directory.
+    pub fn new_external(tag: &str, fs: Arc<dyn ExternalFs>) -> Result<Self, VmmError> {
+        let device = Self::new_inner(tag, None, true)?;
+        device.inner.lock().unwrap().set_external(fs);
+        Ok(device)
+    }
+
     fn new_inner(tag: &str, host_path: Option<String>, read_only: bool) -> Result<Self, VmmError> {
         let exit_code = Arc::new(AtomicI32::new(i32::MAX));
         let fs = devices::virtio::Fs::new(
