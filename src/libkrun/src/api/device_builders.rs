@@ -80,7 +80,7 @@ pub struct AttachContext<'a> {
         dyn Fn(&mut Vmm, String, IrqChip, Arc<Mutex<dyn VirtioDevice>>) -> Result<(), VmmError>
             + 'a,
     >,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     map_sender: Option<crossbeam_channel::Sender<utils::worker_message::WorkerMessage>>,
 }
 
@@ -91,7 +91,7 @@ impl<'a> AttachContext<'a> {
         shm_manager: &'a ShmManager,
         intc: IrqChip,
         device_index: usize,
-        #[cfg(target_os = "macos")] map_sender: Option<
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: Option<
             crossbeam_channel::Sender<utils::worker_message::WorkerMessage>,
         >,
     ) -> Self {
@@ -106,7 +106,7 @@ impl<'a> AttachContext<'a> {
                     .map_err(|e| VmmError::Internal(format!("{e:?}")))?;
                 Ok(())
             }),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
         }
     }
@@ -133,7 +133,7 @@ impl<'a> AttachContext<'a> {
                     .map_err(|e| VmmError::Internal(format!("{e:?}")))?;
                 Ok(())
             }),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender: None,
         }
     }
@@ -236,9 +236,12 @@ impl<'a> AttachContext<'a> {
         setup_terminal_raw_mode(self.vmm, Some(handle), false);
     }
 
-    /// Get the macOS memory mapping channel sender, if available.
-    /// Used by GPU and Fs devices for DAX memory mapping on macOS.
-    #[cfg(target_os = "macos")]
+    /// Get the memory mapping channel sender, if available.
+    ///
+    /// Used by the GPU device, and by Fs on macOS, to reach the VMM worker
+    /// thread -- the only one that may call into the hypervisor to alias a
+    /// host pointer into guest physical memory.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn map_sender(
         &self,
     ) -> Option<crossbeam_channel::Sender<utils::worker_message::WorkerMessage>> {
@@ -320,7 +323,7 @@ mod sealed {
             event_manager: &mut EventManager,
             shm_manager: &ShmManager,
             intc: IrqChip,
-            #[cfg(target_os = "macos")] map_sender: Option<
+            #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: Option<
                 crossbeam_channel::Sender<utils::worker_message::WorkerMessage>,
             >,
         ) -> Result<(), VmmError>;
@@ -401,7 +404,7 @@ impl sealed::Sealed for MmioDeviceManager<'_> {
         event_manager: &mut EventManager,
         shm_manager: &ShmManager,
         intc: IrqChip,
-        #[cfg(target_os = "macos")] map_sender: Option<
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: Option<
             crossbeam_channel::Sender<utils::worker_message::WorkerMessage>,
         >,
     ) -> Result<(), VmmError> {
@@ -412,7 +415,7 @@ impl sealed::Sealed for MmioDeviceManager<'_> {
                 shm_manager,
                 intc.clone(),
                 i,
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 map_sender.clone(),
             );
             device.attach(&mut ctx)?;
@@ -492,7 +495,7 @@ impl sealed::Sealed for PciDeviceManager<'_> {
         event_manager: &mut EventManager,
         shm_manager: &ShmManager,
         intc: IrqChip,
-        #[cfg(target_os = "macos")] _map_sender: Option<
+        #[cfg(any(target_os = "macos", target_os = "windows"))] _map_sender: Option<
             crossbeam_channel::Sender<utils::worker_message::WorkerMessage>,
         >,
     ) -> Result<(), VmmError> {
@@ -1844,8 +1847,9 @@ impl<'a> AttachDevice<'a> for GpuDevice {
             self.virgl_flags,
             displays,
             self.backend.inner,
-            #[cfg(target_os = "macos")]
-            ctx.map_sender().expect("macOS requires map_sender for GPU"),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            ctx.map_sender()
+                .expect("the GPU device needs a map_sender on this host"),
         )
         .map_err(|e| VmmError::Internal(format!("gpu: {e:?}")))?;
 

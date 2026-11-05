@@ -137,9 +137,13 @@ impl Vm {
         guest_addr: u64,
         len: u64,
     ) {
+        let len = round_up_to_host_page(len);
+
         debug!("add_mapping: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
+        // Nothing is mapped at this offset the first time a blob lands there,
+        // so a failed unmap is the normal case rather than an error.
         if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
-            error!("Error removing memory map: {e:?}");
+            debug!("no previous mapping at {guest_addr:x} to remove: {e:?}");
         }
 
         if let Err(e) = self.hvf_vm.map_memory(host_addr, guest_addr, len) {
@@ -151,6 +155,10 @@ impl Vm {
     }
 
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
+        // Must match the rounding add_mapping used, or the unmap does not line
+        // up with the mapping it is meant to undo.
+        let len = round_up_to_host_page(len);
+
         debug!("remove_mapping: guest_addr={guest_addr:x}, len={len}");
         if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
             error!("Error removing memory map: {e:?}");
@@ -212,6 +220,15 @@ impl Vm {
             .map_err(Error::SetUserMemoryRegion)?;
         Ok(reclaimed)
     }
+}
+
+/// Hypervisor.framework works in host pages -- 16 KiB on Apple Silicon --
+/// while virtio-gpu blob resources are sized in 4 KiB guest pages. Mapping a
+/// length that is not a whole number of host pages is rejected outright.
+fn round_up_to_host_page(len: u64) -> u64 {
+    // SAFETY: sysconf with a valid name has no preconditions.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    len.div_ceil(page_size) * page_size
 }
 
 /// Encapsulates configuration parameters for the guest vCPUS.

@@ -8,12 +8,13 @@
 //! and routes I/O and MMIO exits through the WHP instruction emulator.
 
 use log::{debug, error};
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::mem;
 use std::result;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
@@ -98,13 +99,49 @@ pub type Result<T> = result::Result<T, Error>;
 
 pub struct Vm {
     whp_vm: Arc<WhpVm>,
+    /// What this partition has aliased into the guest's virtio-gpu shm window:
+    /// guest address -> (host pointer, length).
+    ///
+    /// Kept because WHP does not split a GPA range on unmap, so taking a mapping
+    /// down needs the length it went up with rather than the length of whatever
+    /// is going in next. Without it a blob of a different size lands on the old
+    /// range: the unmap is refused, the map that follows overlaps, and the
+    /// partition's own record of its ranges is left inconsistent -- which on this
+    /// path does not fail the call, it bugchecks the host.
+    blob_mappings: Mutex<BTreeMap<u64, (u64, u64)>>,
+}
+
+/// The mapping in `mappings` that `[guest_addr, guest_addr + len)` would overlap.
+///
+/// A range that starts below this one but reaches into it overlaps as badly as one
+/// that starts inside it, and neither can be undone by an exact unmap -- so both are
+/// refused rather than mapped over.
+fn overlapping(
+    mappings: &BTreeMap<u64, (u64, u64)>,
+    guest_addr: u64,
+    len: u64,
+) -> Option<(u64, u64, u64)> {
+    let below = mappings
+        .range(..=guest_addr)
+        .next_back()
+        .filter(|(start, (_, mapped))| start.saturating_add(*mapped) > guest_addr);
+    let above = mappings.range(guest_addr..).next().filter(|(start, _)| {
+        // `len == 0` maps nothing, so nothing can be inside it.
+        **start < guest_addr.saturating_add(len)
+    });
+    below
+        .or(above)
+        .map(|(start, (host, mapped))| (*start, *host, *mapped))
 }
 
 impl Vm {
     pub fn new(vcpu_count: u8) -> Result<Self> {
         whp::check_hypervisor().map_err(Error::WhpNotAvailable)?;
         let whp_vm = Arc::new(WhpVm::new(vcpu_count as u32).map_err(Error::VmSetup)?);
-        Ok(Vm { whp_vm })
+        Ok(Vm {
+            whp_vm,
+            blob_mappings: Mutex::new(BTreeMap::new()),
+        })
     }
 
     pub fn memory_init(&mut self, guest_mem: &GuestMemoryMmap) -> Result<()> {
@@ -131,6 +168,95 @@ impl Vm {
 
     pub fn whp_vm(&self) -> &Arc<WhpVm> {
         &self.whp_vm
+    }
+
+    /// Aliases a host pointer into the guest's virtio-gpu shm window.
+    ///
+    /// The pointer comes from the venus context's `vkMapMemory`, by way of
+    /// `virgl_renderer_resource_get_map_ptr()`. WHP takes it: see
+    /// `examples/whp_map_probe.rs`, which checks host-visible system memory and
+    /// ReBAR alike, with a vCPU reading and writing through the mapping rather
+    /// than only the call returning S_OK.
+    ///
+    /// No rounding here, unlike the macOS path: WHP wants 4 KiB, which is what
+    /// a blob resource is already sized in.
+    pub fn add_mapping(
+        &self,
+        reply_sender: Sender<bool>,
+        host_addr: u64,
+        guest_addr: u64,
+        len: u64,
+    ) {
+        debug!("add_mapping: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
+
+        let mut mappings = self.blob_mappings.lock().unwrap();
+
+        // What is already at this address comes down with the length it went up
+        // with. The first blob to land here has nothing to undo, which is why
+        // this is a lookup rather than an unmap whose failure is shrugged off:
+        // an unmap that fails when there *is* a mapping is the case that must
+        // not go on to map over it.
+        if let Some((old_host, old_len)) = mappings.remove(&guest_addr) {
+            if let Err(e) = self.whp_vm.unmap_memory(guest_addr, old_len) {
+                error!(
+                    "refusing to map over the mapping at {guest_addr:x} \
+                     (host {old_host:x}, len {old_len}) that would not come down: {e}"
+                );
+                mappings.insert(guest_addr, (old_host, old_len));
+                reply_sender.send(false).unwrap();
+                return;
+            }
+        }
+
+        if let Some((start, host, mapped)) = overlapping(&mappings, guest_addr, len) {
+            error!(
+                "refusing to map {guest_addr:x}+{len}: it overlaps the mapping at \
+                 {start:x} (host {host:x}, len {mapped}), which no exact unmap undoes"
+            );
+            reply_sender.send(false).unwrap();
+            return;
+        }
+
+        // SAFETY: the caller hands over a host mapping that stays live until
+        // the matching remove_mapping, which is what the gpu worker guarantees
+        // by holding the resource for as long as the guest has it mapped.
+        let res = unsafe {
+            self.whp_vm
+                .map_memory(host_addr as *mut c_void, guest_addr, len)
+        };
+        if let Err(e) = res {
+            error!("Error adding memory map: {e}");
+            reply_sender.send(false).unwrap();
+        } else {
+            mappings.insert(guest_addr, (host_addr, len));
+            reply_sender.send(true).unwrap();
+        }
+    }
+
+    pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
+        debug!("remove_mapping: guest_addr={guest_addr:x}, len={len}");
+
+        let mut mappings = self.blob_mappings.lock().unwrap();
+
+        // The recorded length, for the same reason `add_mapping` uses it: the
+        // caller's is the resource's size, which is what the mapping was made
+        // with today and need not stay that way.
+        let Some(&(_, mapped)) = mappings.get(&guest_addr) else {
+            error!("no mapping at {guest_addr:x} to remove");
+            reply_sender.send(false).unwrap();
+            return;
+        };
+        if mapped != len {
+            debug!("removing {guest_addr:x} with its mapped length {mapped}, not {len}");
+        }
+
+        if let Err(e) = self.whp_vm.unmap_memory(guest_addr, mapped) {
+            error!("Error removing memory map: {e}");
+            reply_sender.send(false).unwrap();
+        } else {
+            mappings.remove(&guest_addr);
+            reply_sender.send(true).unwrap();
+        }
     }
 }
 

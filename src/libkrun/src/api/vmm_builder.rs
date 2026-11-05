@@ -463,9 +463,10 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         }
         #[cfg(not(any(feature = "amd-sev", feature = "tdx")))]
         {
+            // On Windows the GPU device maps blobs into the guest through the worker, as on macOS.
             #[cfg(target_arch = "x86_64")]
             {
-                builder_cfg.split_irqchip
+                builder_cfg.split_irqchip || cfg!(all(feature = "gpu", target_os = "windows"))
             }
             // On macOS, devices change the guest's memory map through the worker.
             #[cfg(not(target_arch = "x86_64"))]

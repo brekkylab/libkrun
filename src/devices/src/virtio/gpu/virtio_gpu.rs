@@ -12,16 +12,13 @@ use super::protocol::{
     GpuResponse, GpuResponsePlaneInfo, VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE,
     VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAX_SCANOUTS, VirtioGpuResult,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::{Sender, unbounded};
 use krun_display::{
     DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, Rect, ResourceFormat,
 };
 use libc::c_void;
-#[cfg(any(
-    all(target_os = "linux", feature = "virgl_resource_map2"),
-    target_os = "macos"
-))]
+#[cfg(all(target_os = "linux", feature = "virgl_resource_map2"))]
 use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_DMABUF;
 #[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
 use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD;
@@ -37,7 +34,9 @@ use rutabaga_gfx::{
     Rutabaga, RutabagaBuilder, RutabagaDescriptor, RutabagaFence, RutabagaFenceHandler,
     RutabagaIovec, RutabagaPath, RutabagaResult, Transfer3D, VirtioFsLookup,
 };
-#[cfg(target_os = "macos")]
+#[cfg(windows)]
+use rutabaga_gfx::{RutabagaError, RutabagaUnsupported};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap, VolatileSlice};
 
@@ -187,7 +186,7 @@ pub struct VirtioGpu {
     rutabaga: Rutabaga,
     resources: BTreeMap<u32, VirtioGpuResource>,
     fence_state: Arc<Mutex<FenceState>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     map_sender: Sender<WorkerMessage>,
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
     displays: Box<[DisplayInfo]>,
@@ -347,7 +346,7 @@ impl VirtioGpu {
         queue_ctl: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
         virgl_flags: u32,
-        #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend,
@@ -388,7 +387,7 @@ impl VirtioGpu {
             scanouts: Default::default(),
             displays,
             display_backend,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
         }
     }
@@ -449,7 +448,36 @@ impl VirtioGpu {
     }
 
     /// Releases guest kernel reference on the resource.
-    pub fn unref_resource(&mut self, resource_id: u32) -> VirtioGpuResult {
+    pub fn unref_resource(
+        &mut self,
+        resource_id: u32,
+        shm_region: &VirtioShmRegion,
+    ) -> VirtioGpuResult {
+        // A blob the guest mapped and never unmapped is still aliased into its address
+        // space by the hypervisor, and that alias points at the host mapping this
+        // function is about to drop. So the hypervisor's mapping goes first.
+        //
+        // Nothing in the protocol makes a guest unmap before it unrefs -- a process that
+        // dies holding a blob does exactly this -- and on Windows what is left behind is
+        // not merely a wrong alias: the next map into that window walks the stale range
+        // and bugchecks the host from `Vid!VsmmVaGpaCoreMapGpaRange`, with the guest's
+        // ordering deciding whether the machine stays up.
+        //
+        // An unmap that fails leaves the resource in place, holding the host mapping the
+        // alias still points at, rather than freeing it out from under the hypervisor.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            if self
+                .resources
+                .get(&resource_id)
+                .is_some_and(|resource| resource.shmem_offset.is_some())
+            {
+                self.resource_unmap_blob(resource_id, shm_region)?;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        let _ = shm_region;
+
         let resource = self
             .resources
             .remove(&resource_id)
@@ -579,10 +607,14 @@ impl VirtioGpu {
                 .present_frame(scanout_id, frame_id, Some(&rect))?
         }
 
+        // A component that has no resource_flush -- virgl among them -- reports
+        // it as MagmaGpuError::Unsupported, wrapped. `RutabagaError` has no
+        // `Unsupported` of its own, and never did, so this arm as upstream
+        // wrote it could not compile.
         #[cfg(windows)]
         match self.rutabaga.resource_flush(resource_id) {
             Ok(_) => return Ok(OkNoData),
-            Err(RutabagaError::Unsupported) => {}
+            Err(RutabagaError::MagmaGpuError(RutabagaUnsupported)) => {}
             Err(e) => return Err(ErrRutabaga(e)),
         }
 
@@ -931,7 +963,7 @@ impl VirtioGpu {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
         })
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn resource_map_blob(
         &mut self,
         resource_id: u32,
@@ -943,45 +975,61 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
-        let map_ptr = self.rutabaga.map(resource_id).map_err(|_| ErrUnspec)?.ptr;
+        let map_info = self.rutabaga.map_info(resource_id).map_err(|e| {
+            error!("resource_map_blob: map_info failed for resource {resource_id}: {e:?}");
+            ErrUnspec
+        })?;
+        let map_ptr = self
+            .rutabaga
+            .map(resource_id)
+            .map_err(|e| {
+                error!("resource_map_blob: map failed for resource {resource_id}: {e:?}");
+                ErrUnspec
+            })?
+            .ptr;
 
-        if let Ok(export) = self.rutabaga.export_blob(resource_id)
-            && let Some(mesa_handle) = export.as_mesa_handle()
-        {
-            if mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
-                let guest_addr = checked_blob_map_addr(
-                    shm_region.guest_addr,
-                    offset,
-                    resource.size,
-                    shm_region.size as u64,
-                )
-                .ok_or(ErrUnspec)?;
-                debug!(
-                    "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
-                    map_ptr, guest_addr, resource.size
-                );
+        // The mapping below consumes only the host pointer plus the hypervisor
+        // aliasing it into the guest shm window; the export handle is never
+        // used, it was a validity gate. No blob here is a dmabuf: on macOS
+        // virglrenderer exports venus memory as shm, and on Windows it exports
+        // nothing a descriptor could hold. Requiring a dmabuf export here
+        // rejects every blob either host can actually produce.
+        let guest_addr = checked_blob_map_addr(
+            shm_region.guest_addr,
+            offset,
+            resource.size,
+            shm_region.size as u64,
+        )
+        .ok_or(ErrUnspec)?;
+        debug!(
+            "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
+            map_ptr, guest_addr, resource.size
+        );
 
-                let (reply_sender, reply_receiver) = unbounded();
-                self.map_sender
-                    .send(WorkerMessage::GpuAddMapping(
-                        reply_sender,
-                        map_ptr,
-                        guest_addr,
-                        resource.size,
-                    ))
-                    .unwrap();
-                if !reply_receiver.recv().unwrap() {
-                    return Err(ErrUnspec);
-                }
-            } else {
-                return Err(ErrUnspec);
-            }
-        } else {
+        let (reply_sender, reply_receiver) = unbounded();
+        // The worker is gone once the VMM is, and the guest cannot be given the blob then.
+        let mapped = self
+            .map_sender
+            .send(WorkerMessage::GpuAddMapping(
+                reply_sender,
+                map_ptr,
+                guest_addr,
+                resource.size,
+            ))
+            .is_ok()
+            && reply_receiver.recv().unwrap_or(false);
+        if !mapped {
+            // Nothing aliases the host mapping, so it goes now rather than at unref.
+            let _ = self.rutabaga.unmap(resource_id);
             return Err(ErrUnspec);
         }
 
         resource.shmem_offset = Some(offset);
+        // `rutabaga.map` mapped the blob into this process, and nothing else unmaps it:
+        // virglrenderer closes a resource's fd on unref but leaves a mapping of it in
+        // place, which keeps the memory behind it -- for venus on macOS, the whole shm
+        // allocation -- alive until the VMM exits.
+        resource.rutabaga_external_mapping = true;
         // Access flags not a part of the virtio-gpu spec.
         Ok(OkMapInfo {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
@@ -1023,7 +1071,7 @@ impl VirtioGpu {
 
         Ok(OkNoData)
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn resource_unmap_blob(
         &mut self,
         resource_id: u32,
@@ -1044,15 +1092,24 @@ impl VirtioGpu {
         );
 
         let (reply_sender, reply_receiver) = unbounded();
-        self.map_sender
+        let unmapped = self
+            .map_sender
             .send(WorkerMessage::GpuRemoveMapping(
                 reply_sender,
                 guest_addr,
                 resource.size,
             ))
-            .unwrap();
-        if !reply_receiver.recv().unwrap() {
+            .is_ok()
+            && reply_receiver.recv().unwrap_or(false);
+        if !unmapped {
             return Err(ErrUnspec);
+        }
+
+        // The guest no longer sees it, so neither need this process: the memory goes as
+        // soon as the guest lets go of it, not only when the resource does.
+        if resource.rutabaga_external_mapping {
+            self.rutabaga.unmap(resource_id)?;
+            resource.rutabaga_external_mapping = false;
         }
 
         resource.shmem_offset = None;

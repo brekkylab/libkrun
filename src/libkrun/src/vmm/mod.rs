@@ -57,12 +57,11 @@ use crate::vmm::device_manager::mmio::MMIODeviceManager;
 use crate::vmm::device_manager::pci::PciHostManager;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::vmm::vstate::VcpuEvent;
-#[cfg(not(target_os = "windows"))]
 use crate::vmm::vstate::Vm;
 use crate::vmm::vstate::{Vcpu, VcpuHandle, VcpuResponse};
 
 use arch::{ArchMemoryInfo, InitrdConfig};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::fdt;
@@ -157,7 +156,6 @@ pub struct Vmm {
 
     pub(crate) vcpus_handles: Vec<VcpuHandle>,
     pub(crate) exit_evt: EventFd,
-    #[cfg(not(target_os = "windows"))]
     pub(crate) vm: Vm,
     pub(crate) exit_observers: Vec<Arc<Mutex<dyn VmmExitObserver>>>,
     pub(crate) exit_code: Arc<AtomicI32>,
@@ -435,7 +433,7 @@ impl Vmm {
         &self.vm
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn add_mapping(
         &self,
         reply_sender: Sender<bool>,
@@ -447,7 +445,7 @@ impl Vmm {
             .add_mapping(reply_sender, host_addr, guest_addr, len);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
         self.vm.remove_mapping(reply_sender, guest_addr, len);
     }

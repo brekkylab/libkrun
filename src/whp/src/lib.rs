@@ -30,7 +30,7 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64ApicEoi, WHvRunVpExitReasonX64Cpuid,
     WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64InterruptWindow,
     WHvRunVpExitReasonX64IoPortAccess, WHvRunVpExitReasonX64MsrAccess, WHvSetPartitionProperty,
-    WHvSetVirtualProcessorRegisters, WHvSetupPartition, WHvX64LocalApicEmulationModeXApic,
+    WHvSetVirtualProcessorRegisters, WHvSetupPartition, WHvUnmapGpaRange, WHvX64LocalApicEmulationModeXApic,
     WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRax, WHvX64RegisterRbx,
     WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
 };
@@ -45,6 +45,7 @@ pub enum Error {
     SetupPartition(i32),
     DeletePartition(i32),
     MapGpaRange(i32),
+    UnmapGpaRange(i32),
     RequestInterrupt(i32),
     CreateVirtualProcessor(i32),
     DeleteVirtualProcessor(i32),
@@ -72,6 +73,7 @@ impl Display for Error {
             SetupPartition(hr) => write!(f, "WHvSetupPartition failed: HRESULT 0x{hr:08x}"),
             DeletePartition(hr) => write!(f, "WHvDeletePartition failed: HRESULT 0x{hr:08x}"),
             MapGpaRange(hr) => write!(f, "WHvMapGpaRange failed: HRESULT 0x{hr:08x}"),
+            UnmapGpaRange(hr) => write!(f, "WHvUnmapGpaRange failed: HRESULT 0x{hr:08x}"),
             RequestInterrupt(hr) => write!(f, "WHvRequestInterrupt failed: HRESULT 0x{hr:08x}"),
             CreateVirtualProcessor(hr) => {
                 write!(f, "WHvCreateVirtualProcessor failed: HRESULT 0x{hr:08x}")
@@ -568,6 +570,23 @@ impl WhpVm {
         };
         if hr != S_OK {
             Err(Error::MapGpaRange(hr))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Removes a mapping previously made by [`map_memory`].
+    ///
+    /// The range has to match one that was mapped: WHP does not split a GPA
+    /// range on unmap.
+    pub fn unmap_memory(&self, guest_start_addr: u64, size: u64) -> Result<(), Error> {
+        if (guest_start_addr as usize | size as usize) & 0xFFF != 0 {
+            return Err(Error::MemoryAlignment);
+        }
+
+        let hr = unsafe { WHvUnmapGpaRange(self.handle, guest_start_addr, size) };
+        if hr != S_OK {
+            Err(Error::UnmapGpaRange(hr))
         } else {
             Ok(())
         }

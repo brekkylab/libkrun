@@ -1356,7 +1356,6 @@ pub fn build_microvm(
         exit_evt,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
-        #[cfg(not(target_os = "windows"))]
         vm,
         mmio_device_manager,
         #[cfg(all(
@@ -1388,7 +1387,7 @@ pub fn build_microvm(
             event_manager,
             &_shm_manager,
             intc.clone(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             Some(_sender.clone()),
         )
         .map_err(|e| StartMicrovmError::AttachDevice(format!("{e:?}")))?;

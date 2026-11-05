@@ -1,5 +1,6 @@
 //! Structure and wrapper functions emulating eventfd using a Windows manual-reset Event object.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{io, result};
 
@@ -17,7 +18,10 @@ pub const EFD_SEMAPHORE: i32 = 2;
 struct Inner {
     event: HANDLE,
     counter: Mutex<u64>,
-    nonblock: bool,
+    /// Shared with every clone, as O_NONBLOCK is on a POSIX eventfd: it lives
+    /// on the open file description, so `dup` hands out the same flag and
+    /// clearing it through one clone clears it for all of them.
+    nonblock: AtomicBool,
     semaphore: bool,
 }
 
@@ -56,7 +60,7 @@ impl EventFd {
             inner: Arc::new(Inner {
                 event,
                 counter: Mutex::new(0),
-                nonblock: (flag & EFD_NONBLOCK) != 0,
+                nonblock: AtomicBool::new((flag & EFD_NONBLOCK) != 0),
                 semaphore: (flag & EFD_SEMAPHORE) != 0,
             }),
         })
@@ -98,7 +102,7 @@ impl EventFd {
                     }
                     return Ok(result);
                 }
-                if self.inner.nonblock {
+                if self.inner.nonblock.load(Ordering::Relaxed) {
                     return Err(io::ErrorKind::WouldBlock.into());
                 }
             } // Lock is dropped here before blocking so writers can make progress!
@@ -108,6 +112,15 @@ impl EventFd {
                 return Err(io::Error::last_os_error());
             }
         }
+    }
+
+    /// Clears or sets the non-blocking flag, for every clone at once.
+    ///
+    /// The POSIX counterpart is `fcntl(F_SETFL)` on an eventfd, which has the
+    /// same reach: O_NONBLOCK lives on the open file description that `dup`
+    /// shares.
+    pub fn set_nonblocking(&self, nonblock: bool) {
+        self.inner.nonblock.store(nonblock, Ordering::Relaxed);
     }
 
     pub fn try_clone(&self) -> result::Result<EventFd, io::Error> {
