@@ -302,46 +302,48 @@ pub(crate) fn update_peer_credit(
         return update;
     }
 
-    // If we were deadlocked waiting for credit, and credit is now restored:
-    if proxy.status == ProxyStatus::WaitingCreditUpdate && proxy.peer_avail_credit() > 0 {
-        proxy.status = ProxyStatus::Connected;
+    // Re-arming interest is not enough here, whatever the credit update says.
+    // This epoll is IOCP-backed and reports only what arrives *after* a
+    // registration, and the bytes that stranded this proxy arrived while its
+    // interest was empty -- so the edge that would deliver them is already
+    // gone, and a sender with nothing left to send will never produce another.
+    // Pull once, unconditionally.
+    //
+    // Both branches used to be here, but the drain sat behind
+    // `status == WaitingCreditUpdate && peer_avail_credit() > 0`. A credit
+    // update that arrives before the guest has actually freed space fails that
+    // test, takes the quiet path, re-arms, and waits forever: a download into a
+    // slow consumer -- `wget | tar -xz` onto virtiofs -- stops dead, with the
+    // guest still running and every device idle.
+    proxy.status = ProxyStatus::Connected;
 
-        // Proactively pull data to bypass the missed Windows edge-trigger
-        let (signal_queue, wait_credit) = proxy.recv_pkt();
-        update.signal_queue = signal_queue;
+    let (signal_queue, wait_credit) = proxy.recv_pkt();
+    update.signal_queue = signal_queue;
 
-        if proxy.status == ProxyStatus::Closed {
-            proxy.push_reset();
-            update.signal_queue = true;
-            update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-            update.remove_proxy = ProxyRemoval::Deferred;
-        } else if proxy.host_read_closed {
-            update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-        } else if wait_credit {
-            // We immediately ran out of credit again. Suspend again and ask for more.
-            proxy.status = ProxyStatus::WaitingCreditUpdate;
-            let rx = MuxerRx::CreditRequest {
-                local_port: proxy.local_port,
-                peer_port: proxy.peer_port,
-                fwd_cnt: proxy.tx_cnt.0,
-            };
-            update.push_credit_req = Some(rx);
-            update.polling = Some((
-                proxy.id,
-                proxy.fd.as_raw_socket() as RawFd,
-                EventSet::empty(),
-            ));
-        } else {
-            // Successfully drained, safe to listen for the next edge
-            update.polling = Some((
-                proxy.id,
-                proxy.fd.as_raw_socket() as RawFd,
-                EventSet::IN | EventSet::READ_HANG_UP,
-            ));
-        }
+    if proxy.status == ProxyStatus::Closed {
+        proxy.push_reset();
+        update.signal_queue = true;
+        update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
+        update.remove_proxy = ProxyRemoval::Deferred;
+    } else if proxy.host_read_closed {
+        update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
+    } else if wait_credit {
+        // Still nothing to write into. Park again and ask for more; the next
+        // update comes back through here and pulls again.
+        proxy.status = ProxyStatus::WaitingCreditUpdate;
+        let rx = MuxerRx::CreditRequest {
+            local_port: proxy.local_port,
+            peer_port: proxy.peer_port,
+            fwd_cnt: proxy.tx_cnt.0,
+        };
+        update.push_credit_req = Some(rx);
+        update.polling = Some((
+            proxy.id,
+            proxy.fd.as_raw_socket() as RawFd,
+            EventSet::empty(),
+        ));
     } else {
-        // Normal update (wasn't suspended)
-        proxy.status = ProxyStatus::Connected;
+        // Drained, so the next edge is one this registration will see.
         update.polling = Some((
             proxy.id,
             proxy.fd.as_raw_socket() as RawFd,
