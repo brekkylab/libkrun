@@ -9,6 +9,8 @@ use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::process;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicI32, Ordering};
 
 #[cfg(target_os = "linux")]
 use nix::fcntl::{self, OFlag};
@@ -63,12 +65,50 @@ pub fn setup_redirects() {
     }
 }
 
+/// A descriptor on the virtiofs root, held from before a pivot -- or -1 for a boot that
+/// never pivoted and can still reach it by name.
+///
+/// The exit code travels to the host as an ioctl on the virtiofs mount, so a boot that
+/// pivoted onto a block root has no way to send one: its `/` is that block device, and
+/// the virtiofs mount, while still alive, is under no path at all. Holding a descriptor
+/// open across the pivot is what keeps the channel reachable -- see
+/// [`hold_virtiofs_root`].
+#[cfg(target_os = "linux")]
+static VIRTIOFS_ROOT: AtomicI32 = AtomicI32::new(-1);
+
+/// Keep a descriptor on the virtiofs root, for [`set_exit_code`] to use after a pivot.
+///
+/// Called while `/` is still the virtiofs mount, and deliberately never closed: what it
+/// holds open has to outlive every root that replaces it, and the process exiting is
+/// what closes it.
+#[cfg(target_os = "linux")]
+pub fn hold_virtiofs_root() {
+    use std::os::fd::IntoRawFd;
+
+    if !is_virtiofs(Path::new("/")) {
+        return;
+    }
+    if let Ok(fd) = fcntl::open(Path::new("/"), OFlag::O_RDONLY, Mode::empty()) {
+        VIRTIOFS_ROOT.store(fd.into_raw_fd(), Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_virtiofs(path: &Path) -> bool {
+    statfs::statfs(path).is_ok_and(|fs| fs.filesystem_type() == FsType(VIRTIOFS_MAGIC as _))
+}
+
 #[cfg(target_os = "linux")]
 pub fn set_exit_code(code: i32) {
-    let Ok(fs) = statfs::statfs(Path::new("/")) else {
+    // The held descriptor first: a boot that pivoted has one and its `/` is no longer
+    // the mount the ioctl has to reach.
+    let held = VIRTIOFS_ROOT.load(Ordering::Relaxed);
+    if held >= 0 {
+        unsafe { libc::ioctl(held, KRUN_EXIT_CODE_IOCTL as _, code) };
         return;
-    };
-    if fs.filesystem_type() != FsType(VIRTIOFS_MAGIC as _) {
+    }
+
+    if !is_virtiofs(Path::new("/")) {
         return;
     }
     if let Ok(fd) = fcntl::open(Path::new("/"), OFlag::O_RDONLY, Mode::empty()) {
