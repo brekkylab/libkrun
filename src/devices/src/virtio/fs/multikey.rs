@@ -35,6 +35,11 @@ where
         }
     }
 
+    /// An iterator over every value in the map, in `K1` order.
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.main.values().map(|(_, v)| v)
+    }
+
     /// Returns a reference to the value corresponding to the key.
     ///
     /// The key may be any borrowed form of `K1``, but the ordering on the borrowed form must match
