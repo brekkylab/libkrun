@@ -42,7 +42,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
-use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
 use windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS;
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
@@ -52,7 +52,7 @@ use super::super::super::bindings::{
     self, LINUX_O_APPEND, LINUX_O_CREAT, LINUX_O_DIRECTORY, LINUX_O_EXCL, LINUX_O_NOFOLLOW,
     LINUX_O_TRUNC, LINUX_RENAME_EXCHANGE, LINUX_RENAME_NOREPLACE,
 };
-use super::super::super::linux_errno::{linux_errno_raw, linux_error};
+use super::super::super::linux_errno::linux_errno_raw;
 use super::super::filesystem::*;
 use super::super::fuse;
 use super::super::multikey::MultikeyBTreeMap;
@@ -69,6 +69,8 @@ const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 // IO_STATUS_BLOCK.Information after NtCreateFile made a new file.
 const FILE_CREATED: usize = 2;
+/// Size of the version field an LX symlink's reparse data starts with.
+const LX_SYMLINK_VERSION_LEN: usize = 4;
 
 const S_ISUID: u32 = 0o04_000;
 const S_IXGRP: u32 = 0o00_010;
@@ -108,9 +110,21 @@ impl Drop for HandleGuard {
 
 /// Convert a Win32 path to an NT object-manager path (`\??\C:\...`) as a
 /// null-terminated wide string.
+///
+/// Separators are normalized to backslashes on the way. A Win32 path may spell them either
+/// way -- `Path::join("examples/sam3")` makes one that does, and every Win32 call takes it --
+/// but the object manager is not Win32: there a `/` is an ordinary character in a name, so
+/// such a path names a file that is not there and `NtCreateFile` answers with
+/// `ERROR_INVALID_NAME`. A `/` cannot occur in a Windows filename, so replacing every one of
+/// them loses nothing.
 fn path_to_nt_wide(path: &Path) -> Vec<u16> {
-    let prefix: [u16; 4] = [b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16];
-    let path_wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    const SEP: u16 = b'\\' as u16;
+    let prefix: [u16; 4] = [SEP, b'?' as u16, b'?' as u16, SEP];
+    let path_wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .map(|c| if c == b'/' as u16 { SEP } else { c })
+        .collect();
 
     // Already has \\?\ prefix convert to \??\
     if path_wide.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]) {
@@ -284,29 +298,6 @@ fn check_name(name: &CStr) -> io::Result<()> {
 fn child_path(parent: &Path, name: &CStr) -> io::Result<PathBuf> {
     check_name(name)?;
     Ok(parent.join(cstr_to_path(name)))
-}
-
-/// Refuse a symlink target that resolves outside the shared directory from a link made `depth`
-/// directories below the shared root.
-///
-/// A host program that opens the link follows it, reading the target as a Windows path: `\` is
-/// a separator, `:` names a drive or a stream, a target starting with `/` starts at the root of
-/// a drive, and Win32 drops the trailing dots and spaces of a component, so a component made
-/// only of them does not name what it spells.
-fn check_symlink_target(target: &CStr, mut depth: usize) -> io::Result<()> {
-    let bytes = target.to_bytes();
-    if bytes.first() == Some(&b'/') || bytes.iter().any(|b| matches!(b, b'\\' | b':')) {
-        return Err(einval());
-    }
-    for component in bytes.split(|b| *b == b'/') {
-        match component {
-            b"" | b"." => {}
-            b".." => depth = depth.checked_sub(1).ok_or_else(einval)?,
-            _ if component.iter().all(|b| matches!(b, b'.' | b' ')) => return Err(einval()),
-            _ => depth += 1,
-        }
-    }
-    Ok(())
 }
 
 const FILETIME_UNIX_EPOCH_DIFF: i64 = 116_444_736_000_000_000;
@@ -581,15 +572,91 @@ fn read_lx_symlink_by_handle(handle: HANDLE) -> io::Result<Vec<u8>> {
     }
 
     let data_len = u16::from_le_bytes(buffer[4..6].try_into().unwrap()) as usize;
-    if bytes_returned < (8 + data_len) as u32 {
+    if bytes_returned < (8 + data_len) as u32 || data_len < LX_SYMLINK_VERSION_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Truncated LX_SYMLINK payload",
         ));
     }
 
-    // Target UTF-8 bytes start at offset 8
-    Ok(buffer[8..8 + data_len].to_vec())
+    // The reparse data at offset 8 opens with a 4-byte version field; the
+    // UTF-8 target, unterminated, follows it.
+    Ok(buffer[8 + LX_SYMLINK_VERSION_LEN..8 + data_len].to_vec())
+}
+
+/// Create an `IO_REPARSE_TAG_LX_SYMLINK` reparse point: the WSL representation
+/// of a symbolic link, which stores its target verbatim as a Linux path.
+///
+/// `std::os::windows::fs::symlink_file` cannot stand in for this. It creates a
+/// native NT symlink, which needs `SeCreateSymbolicLinkPrivilege` -- so every
+/// guest `symlink()` fails with ERROR_PRIVILEGE_NOT_HELD unless the VMM runs
+/// elevated or the host has Developer Mode on -- and which resolves its target
+/// against the current drive, so it could not hold `/bin/busybox` even then.
+/// An LX symlink needs no privilege, and is what `read_lx_symlink_by_handle`
+/// reads back.
+fn write_lx_symlink(path: &Path, target: &[u8]) -> io::Result<()> {
+    /// The version field an LX symlink's reparse data opens with.
+    const LX_SYMLINK_VERSION: u32 = 2;
+    /// REPARSE_DATA_BUFFER header: tag, data length, reserved.
+    const REPARSE_HEADER_LEN: usize = 8;
+    /// MAXIMUM_REPARSE_DATA_BUFFER_SIZE.
+    const MAX_REPARSE_DATA: usize = 16 * 1024;
+
+    let data_len = LX_SYMLINK_VERSION_LEN + target.len();
+    if REPARSE_HEADER_LEN + data_len > MAX_REPARSE_DATA {
+        return Err(io::Error::from_raw_os_error(linux_errno_raw(
+            libc::ENAMETOOLONG,
+        )));
+    }
+
+    let mut buffer = Vec::with_capacity(REPARSE_HEADER_LEN + data_len);
+    buffer.extend_from_slice(&IO_REPARSE_TAG_LX_SYMLINK.to_le_bytes());
+    buffer.extend_from_slice(&(data_len as u16).to_le_bytes());
+    buffer.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+    buffer.extend_from_slice(&LX_SYMLINK_VERSION.to_le_bytes());
+    buffer.extend_from_slice(target);
+
+    // FILE_CREATE so an existing name reports EEXIST, as `symlink(2)` must.
+    let handle = open_handle(
+        path,
+        &OpenFlags {
+            desired_access: GENERIC_WRITE | FILE_WRITE_ATTRIBUTES,
+            create_disposition: FILE_CREATE,
+            create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        },
+    )?;
+
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_SET_REPARSE_POINT,
+            buffer.as_ptr() as *const _,
+            buffer.len() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    let result = if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    unsafe { CloseHandle(handle) };
+
+    if result.is_err() {
+        // The empty file exists by now; a failed symlink must not leave it.
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe { DeleteFileW(wide.as_ptr()) };
+    }
+
+    result
 }
 
 // ADS-backed override_stat helpers  (uid:gid:0mode)
@@ -622,10 +689,13 @@ fn parse_override_stat(buf: &[u8]) -> io::Result<(Option<u32>, Option<u32>, Opti
     Ok((uid, gid, mode))
 }
 
+/// `symlink` selects a no-follow write, for the one caller whose target is a
+/// symlink -- the mode bits of a link have to live on the link.
 fn write_override_stat(
     path: &Path,
     owner: Option<(u32, u32)>,
     mode: Option<u32>,
+    symlink: bool,
 ) -> io::Result<()> {
     let buf = if is_valid_owner(owner)
         && let Some(m) = mode
@@ -662,7 +732,11 @@ fn write_override_stat(
     };
 
     let ads = ads_stream_path(path, OVERRIDE_STAT_STREAM);
-    fs::write(&ads, buf.as_bytes()).map_err(win_err_to_linux)
+    if symlink {
+        write_ads_nofollow(&ads, buf.as_bytes())
+    } else {
+        fs::write(&ads, buf.as_bytes()).map_err(win_err_to_linux)
+    }
 }
 
 fn is_valid_owner(owner: Option<(u32, u32)>) -> bool {
@@ -754,6 +828,46 @@ fn write_ads_by_handle(file_handle: HANDLE, stream_suffix: &str, data: &[u8]) ->
     }
 }
 
+/// Write an alternate data stream without following a reparse point, so the
+/// stream lands on a symlink itself rather than on whatever it names.
+///
+/// `fs::write` cannot do this for an LX symlink at all: the system has no idea
+/// how to resolve that reparse tag, so opening the stream path through Win32
+/// fails with ERROR_CANT_ACCESS_FILE rather than reaching the target.
+fn write_ads_nofollow(ads: &Path, data: &[u8]) -> io::Result<()> {
+    let handle = open_handle(
+        ads,
+        &OpenFlags {
+            desired_access: GENERIC_WRITE,
+            create_disposition: FILE_OVERWRITE_IF,
+            create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        },
+    )
+    .map_err(win_err_to_linux)?;
+
+    let mut iosb: IO_STATUS_BLOCK = unsafe { mem::zeroed() };
+    let status = unsafe {
+        NtWriteFile(
+            handle,
+            std::ptr::null_mut(),
+            None,
+            std::ptr::null(),
+            &mut iosb,
+            data.as_ptr() as *const core::ffi::c_void,
+            data.len() as u32,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    unsafe { CloseHandle(handle) };
+
+    if status >= 0 {
+        Ok(())
+    } else {
+        Err(nt_status_to_io_error(status))
+    }
+}
+
 /// Store a security context as an ADS named after `secctx.name`.
 /// When `symlink` is true, opens with `FILE_OPEN_REPARSE_POINT` so the
 /// ADS is placed on the symlink itself rather than following to the target.
@@ -762,37 +876,7 @@ fn write_secctx(path: &Path, secctx: SecContext, symlink: bool) -> io::Result<()
     let ads = ads_stream_path(path, &stream_name);
 
     if symlink {
-        let h = open_handle(
-            &ads,
-            &OpenFlags {
-                desired_access: GENERIC_WRITE,
-                create_disposition: FILE_OVERWRITE_IF,
-                create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
-            },
-        )
-        .map_err(win_err_to_linux)?;
-
-        let mut iosb: IO_STATUS_BLOCK = unsafe { mem::zeroed() };
-        let status = unsafe {
-            NtWriteFile(
-                h,
-                std::ptr::null_mut(),
-                None,
-                std::ptr::null(),
-                &mut iosb,
-                secctx.secctx.as_ptr() as *const core::ffi::c_void,
-                secctx.secctx.len() as u32,
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        };
-        unsafe { CloseHandle(h) };
-
-        if status >= 0 {
-            Ok(())
-        } else {
-            Err(nt_status_to_io_error(status))
-        }
+        write_ads_nofollow(&ads, &secctx.secctx)
     } else {
         fs::write(&ads, &secctx.secctx).map_err(win_err_to_linux)
     }
@@ -1156,29 +1240,31 @@ fn set_delete_disposition(handle: HANDLE) -> io::Result<()> {
 }
 
 /// Validate that a path is not a reparse point (symlink / junction) before use.
+/// Open a share's root.
+///
+/// The root is followed rather than opened as a link, and is allowed to be one. A mount point
+/// is a reparse point on Windows -- a junction onto the volume behind it -- so a userspace
+/// filesystem attached to the host and then handed to a guest arrives here as one, which is
+/// how `virtx` shares a tree it holds in memory. `FILE_OPEN_REPARSE_POINT` would open the
+/// junction itself, which is not a directory anything can be enumerated from.
+///
+/// It used to refuse a reparse point outright, and that check is gone rather than relaxed,
+/// because it did not buy what its wording suggested. What it covered was the *root*, which
+/// is the path an operator names when starting a session and is inside the trust boundary,
+/// not something a guest picks. What a guest can reach -- a junction planted anywhere under
+/// the share -- was never covered: `lookup` composes a child path by joining strings and
+/// opens it absolutely, `FILE_OPEN_REPARSE_POINT` applies only to the last component, and the
+/// object manager follows every one before it. A junction under the share is also reported to
+/// the guest as a plain directory, since `IO_REPARSE_TAG_MOUNT_POINT` is not treated as a
+/// symlink. Containment belongs there, in `lookup`, and does not exist yet; refusing the root
+/// only made it look as though it did.
 pub fn openat(path: &str) -> io::Result<HANDLE> {
-    let p = Path::new(path);
     let flags = OpenFlags {
         desired_access: FILE_READ_ATTRIBUTES,
         create_disposition: FILE_OPEN,
-        create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        create_options: FILE_SYNCHRONOUS_IO_NONALERT,
     };
-    let h = open_handle(p, &flags)?;
-
-    let info = match get_file_info_by_handle(h) {
-        Ok(info) => info,
-        Err(e) => {
-            unsafe { CloseHandle(h) };
-            return Err(e);
-        }
-    };
-    if (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-        unsafe { CloseHandle(h) };
-        return Err(linux_error(io::Error::other(
-            "Reparse point detected — path is not safe",
-        )));
-    }
-    Ok(h)
+    open_handle(Path::new(path), &flags)
 }
 
 /// Set file attributes together with access and modification times in a
@@ -1346,6 +1432,31 @@ impl PassthroughFs {
 
     fn inode_path(&self, inode: Inode) -> io::Result<Arc<PathBuf>> {
         Ok(self.inode_data(inode)?.get_path())
+    }
+
+    /// Point every cached inode at where its file now lives.
+    ///
+    /// An inode's stored path is how every later operation reaches the file --
+    /// `getattr`, `open` and `setattr` all resolve it -- so an inode the guest
+    /// already holds has to follow the file across a rename, or it goes on
+    /// naming something that is no longer there. `do_lookup` repairs a path
+    /// when the guest looks the name up again, but nothing makes it: a `stat`
+    /// on a handle the guest already has never goes through lookup, and
+    /// answers ENOENT.
+    ///
+    /// A renamed directory takes its whole subtree with it, hence the prefix
+    /// pass rather than a single entry.
+    fn update_paths_after_rename(&self, old_path: &Path, new_path: &Path) {
+        let inodes = self.inodes.read().unwrap();
+
+        for data in inodes.values() {
+            let path = data.get_path();
+            if *path == old_path {
+                data.update_path_if_changed(new_path);
+            } else if let Ok(rest) = path.strip_prefix(old_path) {
+                data.update_path_if_changed(&new_path.join(rest));
+            }
+        }
     }
 
     fn do_lookup(&self, ctx: &Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
@@ -1595,7 +1706,7 @@ impl PassthroughFs {
             if let Ok((_, _, Some(mode))) = read_override_stat(&path) {
                 let new_mode = clear_suid_sgid(mode);
                 if new_mode != mode
-                    && let Err(e) = write_override_stat(&path, None, Some(new_mode))
+                    && let Err(e) = write_override_stat(&path, None, Some(new_mode), false)
                 {
                     error!("clear suid/sgid for inode {inode}: {e}");
                 }
@@ -2209,7 +2320,7 @@ impl FileSystem for PassthroughFs {
                             current_uid.unwrap_or(u32::MAX),
                             current_gid.unwrap_or(u32::MAX),
                         );
-                        write_override_stat(&path, Some(owner_param), current_mode)?;
+                        write_override_stat(&path, Some(owner_param), current_mode, false)?;
                     }
 
                     // The stream now holds these values, so the reply can
@@ -2397,18 +2508,11 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<Entry> {
         let parent_path = self.inode_path(parent)?;
         let link_path = child_path(parent_path.as_path(), name)?;
-        let depth = parent_path
-            .strip_prefix(&self.cfg.root_dir)
-            .map_or(0, |below| below.components().count());
-        check_symlink_target(linkname, depth)?;
-        let target = cstr_to_path(linkname);
 
-        // Windows requires knowing if a symlink target is a file or a directory.
-        // FUSE doesn't provide this distinction upfront, so we try file first,
-        // and safely fall back to directory if it fails.
-        std::os::windows::fs::symlink_file(&target, &link_path)
-            .or_else(|_| std::os::windows::fs::symlink_dir(&target, &link_path))
-            .map_err(win_err_to_linux)?;
+        // The target is stored exactly as the guest gave it -- an unterminated
+        // Linux path, never translated to a Windows one. Nothing on the host
+        // resolves it; only the guest, through `readlink`.
+        write_lx_symlink(&link_path, linkname.to_bytes()).map_err(win_err_to_linux)?;
 
         if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
             if let Some(secctx) = extensions.secctx {
@@ -2419,6 +2523,7 @@ impl FileSystem for PassthroughFs {
                 &link_path,
                 Some((ctx.uid, ctx.gid)),
                 Some(S_IFLNK as u32 | 0o777),
+                true,
             )?;
         }
 
@@ -2550,6 +2655,9 @@ impl FileSystem for PassthroughFs {
                 return Err(win_err_to_linux(e));
             }
             fs::rename(&tmp, &old_path).map_err(win_err_to_linux)?;
+            // Both names still exist; each now holds what the other did.
+            self.update_paths_after_rename(&old_path, &new_path);
+            self.update_paths_after_rename(&new_path, &old_path);
             return Ok(());
         }
 
@@ -2565,10 +2673,13 @@ impl FileSystem for PassthroughFs {
             if res == 0 {
                 return Err(win_err_to_linux(io::Error::last_os_error()));
             }
+            self.update_paths_after_rename(&old_path, &new_path);
             return Ok(());
         }
 
-        fs::rename(&old_path, &new_path).map_err(win_err_to_linux)
+        fs::rename(&old_path, &new_path).map_err(win_err_to_linux)?;
+        self.update_paths_after_rename(&old_path, &new_path);
+        Ok(())
     }
 
     fn link(
@@ -2751,7 +2862,7 @@ impl FileSystem for PassthroughFs {
                 let new_mode = clear_suid_sgid(mode);
                 if new_mode != mode {
                     // Update mode in xattr (ADS)
-                    if let Err(err) = write_override_stat(&path, None, Some(new_mode)) {
+                    if let Err(err) = write_override_stat(&path, None, Some(new_mode), false) {
                         error!("Couldn't clear suid/sgid for inode {inode}: {err}");
                     }
                 }
@@ -2912,9 +3023,15 @@ impl FileSystem for PassthroughFs {
 
         check_xattr_name(name)?;
 
-        // Prevent the guest from reading them directly.
-        // The guest should only see these values through standard stat calls, not raw getxattr queries
-        if is_reserved_xattr(name.to_bytes()) {
+        // Prevent the guest from reading this one directly. The guest should
+        // only see these values through standard stat calls, not raw getxattr
+        // queries. `security.capability` is deliberately not hidden: the guest
+        // kernel reads it on every execve, and an error other than ENODATA
+        // there fails the exec.
+        if name
+            .to_bytes()
+            .eq_ignore_ascii_case(b"user.containers.override_stat")
+        {
             return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES)));
         }
 
@@ -3260,38 +3377,6 @@ mod tests {
     }
 
     #[test]
-    fn a_symlink_target_outside_the_share_is_refused() {
-        for (target, depth) in [
-            (c"/etc/passwd", 2),
-            (c"..", 0),
-            (c"../x", 0),
-            (c"a/../../x", 0),
-            (c"../../x", 1),
-            (c"a\\b", 0),
-            (c"C:x", 0),
-            (c".../../x", 1),
-            (c"a/.. /x", 1),
-        ] {
-            assert!(
-                check_symlink_target(target, depth).is_err(),
-                "{target:?} at depth {depth}"
-            );
-        }
-        for (target, depth) in [
-            (c"x", 0),
-            (c"./a//b/", 0),
-            (c"a/../x", 0),
-            (c"..", 1),
-            (c"../../x", 2),
-        ] {
-            assert!(
-                check_symlink_target(target, depth).is_ok(),
-                "{target:?} at depth {depth}"
-            );
-        }
-    }
-
-    #[test]
     fn a_lookup_stays_within_the_shared_directory() {
         let share = Share::new("lookup");
         let fs = share.served();
@@ -3346,26 +3431,6 @@ mod tests {
         );
         assert!(!made.exists());
         assert_eq!(fs::read(&share.outside).unwrap(), b"host");
-    }
-
-    #[test]
-    fn a_symlink_stays_within_the_shared_directory() {
-        let share = Share::new("symlink");
-        let fs = share.served();
-
-        for (target, name) in [
-            (c"..".to_owned(), c"up"),
-            (c"..\\outside.txt".to_owned(), c"beside"),
-            (name_of(&share.outside), c"host"),
-        ] {
-            refused(
-                fs.symlink(CTX, &target, fuse::ROOT_ID, name, Extensions::default()),
-                einval(),
-                "a symlink target reached an entry outside the share",
-            );
-            let made = share.root.join(name.to_str().unwrap());
-            assert!(fs::symlink_metadata(&made).is_err(), "{made:?}");
-        }
     }
 
     #[test]
