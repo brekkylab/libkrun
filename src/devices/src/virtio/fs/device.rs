@@ -19,6 +19,7 @@ use super::super::{
     VirtioShmRegion,
 };
 use super::ExportTable;
+use super::ExternalFs;
 use super::passthrough;
 use super::virtual_entry::VirtualDirEntry;
 use super::worker::FsWorker;
@@ -58,6 +59,7 @@ pub struct Fs {
     passthrough_cfg: Option<passthrough::Config>,
     read_only: bool,
     virtual_entries: Vec<VirtualDirEntry<'static>>,
+    external: Option<Arc<dyn ExternalFs>>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
     exit_code: Arc<AtomicI32>,
@@ -99,6 +101,7 @@ impl Fs {
             passthrough_cfg: fs_cfg,
             read_only,
             virtual_entries,
+            external: None,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
             exit_code,
@@ -212,6 +215,11 @@ impl Fs {
         cfg.export_fsid
     }
 
+    /// Serve `fs` instead of a host directory.
+    pub fn set_external(&mut self, fs: Arc<dyn ExternalFs>) {
+        self.external = Some(fs);
+    }
+
     pub fn add_virtual_entry(&mut self, entry: VirtualDirEntry<'static>) {
         self.virtual_entries.push(entry);
     }
@@ -306,6 +314,7 @@ impl VirtioDevice for Fs {
             self.passthrough_cfg.clone(),
             self.read_only,
             virtual_entries,
+            self.external.clone(),
             self.worker_stopfd.try_clone().unwrap(),
             self.exit_code.clone(),
             #[cfg(target_os = "macos")]
