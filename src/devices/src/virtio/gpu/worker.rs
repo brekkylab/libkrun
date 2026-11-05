@@ -1,18 +1,20 @@
 use std::io::Read;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+#[cfg(unix)]
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use utils::eventfd::EventFd;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
 use rutabaga_gfx::{
     RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D, ResourceCreate3D,
     ResourceCreateBlob, RutabagaFence, Transfer3D,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
@@ -37,7 +39,7 @@ pub struct Worker {
     interrupt: InterruptTransport,
     shm_region: VirtioShmRegion,
     virgl_flags: u32,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     map_sender: Sender<WorkerMessage>,
     export_table: Option<ExportTable>,
     displays: Box<[DisplayInfo]>,
@@ -52,18 +54,25 @@ impl Worker {
         interrupt: InterruptTransport,
         shm_region: VirtioShmRegion,
         virgl_flags: u32,
-        #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
     ) -> Self {
         // Clone the eventfd so we have our own file description, then set it to blocking mode.
+        // This loop's whole structure depends on it: `read()` is what parks the
+        // worker between kicks, and a non-blocking one turns that into a spin.
         let control_evt = control_q.event.try_clone().unwrap();
-        // SAFETY: control_evt is valid for the duration of the fcntl calls.
-        let fd = unsafe { BorrowedFd::borrow_raw(control_evt.as_raw_fd()) };
-        let flags =
-            OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).unwrap()) & !OFlag::O_NONBLOCK;
-        fcntl(fd, FcntlArg::F_SETFL(flags)).unwrap();
+        #[cfg(unix)]
+        {
+            // SAFETY: control_evt is valid for the duration of the fcntl calls.
+            let fd = unsafe { BorrowedFd::borrow_raw(control_evt.as_raw_fd()) };
+            let flags =
+                OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).unwrap()) & !OFlag::O_NONBLOCK;
+            fcntl(fd, FcntlArg::F_SETFL(flags)).unwrap();
+        }
+        #[cfg(windows)]
+        control_evt.set_nonblocking(false);
 
         Self {
             control_evt,
@@ -72,7 +81,7 @@ impl Worker {
             interrupt,
             shm_region,
             virgl_flags,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
             export_table,
             displays,
@@ -93,7 +102,7 @@ impl Worker {
             self.control_queue.clone(),
             self.interrupt.clone(),
             self.virgl_flags,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             self.map_sender.clone(),
             self.export_table.take(),
             self.displays.clone(),
@@ -144,7 +153,9 @@ impl Worker {
 
                 virtio_gpu.resource_create_3d(resource_id, resource_create_3d)
             }
-            GpuCommand::ResourceUnref(info) => virtio_gpu.unref_resource(info.resource_id),
+            GpuCommand::ResourceUnref(info) => {
+                virtio_gpu.unref_resource(info.resource_id, &self.shm_region)
+            }
             GpuCommand::SetScanout(info) => virtio_gpu.set_scanout(
                 info.scanout_id,
                 info.resource_id,

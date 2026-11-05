@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::mem::size_of;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
@@ -17,7 +17,7 @@ use super::worker::Worker;
 use crate::display::DisplayInfo;
 use crate::virtio::InterruptTransport;
 use krun_display::DisplayBackend;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use utils::worker_message::WorkerMessage;
 
 // Supported features.
@@ -39,7 +39,7 @@ pub struct Gpu {
     pub(crate) device_state: DeviceState,
     shm_region: Option<VirtioShmRegion>,
     virgl_flags: u32,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     map_sender: Sender<WorkerMessage>,
     export_table: Option<ExportTable>,
     displays: Box<[DisplayInfo]>,
@@ -52,7 +52,7 @@ impl Gpu {
         virgl_flags: u32,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
-        #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: Sender<WorkerMessage>,
     ) -> super::Result<Gpu> {
         Ok(Gpu {
             avail_features: AVAIL_FEATURES,
@@ -60,14 +60,17 @@ impl Gpu {
             device_state: DeviceState::Inactive,
             shm_region: None,
             virgl_flags,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
             export_table: None,
             displays,
             display_backend,
             // Blobs are mapped into the guest in host pages, which can be
-            // larger than the guest's (16 KiB on Apple silicon).
+            // larger than the guest's (16 KiB on Apple silicon). WHP maps in 4 KiB.
+            #[cfg(unix)]
             blob_alignment: unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32,
+            #[cfg(windows)]
+            blob_alignment: 4096,
         })
     }
 
@@ -225,7 +228,7 @@ impl VirtioDevice for Gpu {
             interrupt.clone(),
             shm_region,
             self.virgl_flags,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             self.map_sender.clone(),
             self.export_table.take(),
             self.displays.clone(),
@@ -260,7 +263,7 @@ mod tests {
             0,
             Box::new([]),
             NoopDisplayBackend::into_display_backend(None),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             crossbeam_channel::unbounded().0,
         )
         .unwrap();
@@ -270,7 +273,10 @@ mod tests {
         );
         let mut data = [0u8; 4];
         gpu.read_config(16, &mut data);
+        #[cfg(unix)]
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
+        #[cfg(windows)]
+        let page_size = 4096;
         assert_eq!(u32::from_le_bytes(data), page_size);
     }
 }

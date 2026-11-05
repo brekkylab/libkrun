@@ -43,9 +43,9 @@ impl super::Vmm {
     #[allow(dead_code)]
     fn match_worker_message(&mut self, msg: WorkerMessage) {
         match msg {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             WorkerMessage::GpuAddMapping(s, h, g, l) => self.add_mapping(s, h, g, l),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             WorkerMessage::GpuRemoveMapping(s, g, l) => self.remove_mapping(s, g, l),
             #[cfg(target_os = "macos")]
             WorkerMessage::ReclaimMemory(s, g, l) => self.reclaim_memory(s, g, l),
