@@ -63,6 +63,10 @@ pub struct Config {
     pub dhcp: bool,
     #[cfg(target_os = "linux")]
     pub dhcp_renew: bool,
+    /// Everything else the config's `mounts` asked for, in the order it asked. Mounted
+    /// after the root is in place -- see [`crate::mounts`].
+    #[cfg(target_os = "linux")]
+    pub mounts: Vec<crate::mounts::Mount>,
 }
 
 pub fn load(#[cfg(target_os = "linux")] is_mount_point: impl Fn(&str) -> bool) -> Config {
@@ -117,18 +121,39 @@ pub fn load(#[cfg(target_os = "linux")] is_mount_point: impl Fn(&str) -> bool) -
     };
     let workdir = process.cwd;
 
-    // Find the first tmpfs mount whose destination is not already mounted.
+    // The first tmpfs mount whose destination is not already mounted, kept apart because
+    // it is mounted by its own path in fs.rs; everything else goes to `mounts`, which is
+    // mounted as the config spells it once the root is in place. An entry missing any of
+    // the three fields is dropped: there is nothing to mount and nothing to say about it
+    // that the boot could act on.
     #[cfg(target_os = "linux")]
-    let tmpfs = raw.mounts.unwrap_or_default().into_iter().find_map(|m| {
-        let dest = m.destination?;
-        let ty = m.mount_type.as_deref().unwrap_or("");
-        let src = m.source.as_deref().unwrap_or("");
-        if ty == "tmpfs" && src == "tmpfs" && !is_mount_point(&dest) {
-            Some(dest)
-        } else {
-            None
+    let (tmpfs, mounts) = {
+        let mut tmpfs: Option<String> = None;
+        let mut mounts = Vec::new();
+
+        for m in raw.mounts.unwrap_or_default() {
+            let (Some(destination), Some(fs_type), Some(source)) =
+                (m.destination, m.mount_type, m.source)
+            else {
+                continue;
+            };
+
+            if fs_type == "tmpfs" && source == "tmpfs" {
+                if tmpfs.is_none() && !is_mount_point(&destination) {
+                    tmpfs = Some(destination);
+                }
+                continue;
+            }
+
+            mounts.push(crate::mounts::Mount {
+                source,
+                fs_type,
+                destination,
+            });
         }
-    });
+
+        (tmpfs, mounts)
+    };
 
     Config {
         argv,
@@ -139,6 +164,8 @@ pub fn load(#[cfg(target_os = "linux")] is_mount_point: impl Fn(&str) -> bool) -
         dhcp,
         #[cfg(target_os = "linux")]
         dhcp_renew,
+        #[cfg(target_os = "linux")]
+        mounts,
     }
 }
 

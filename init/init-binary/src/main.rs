@@ -7,6 +7,8 @@ mod exec;
 mod freebsd;
 #[cfg(target_os = "linux")]
 mod fs;
+#[cfg(target_os = "linux")]
+mod mounts;
 #[cfg(feature = "timesync")]
 mod timesync;
 
@@ -117,6 +119,11 @@ fn main() -> anyhow::Result<()> {
     if let Some(ref path) = cfg.tmpfs {
         fs::mount_tmpfs(path)?;
     }
+
+    // After the root is whatever it is going to be, so that a share lands on the root the
+    // workload sees rather than the one a pivot left behind -- see `mounts`.
+    #[cfg(target_os = "linux")]
+    mounts::mount_all(&cfg.mounts)?;
 
     env::apply_env();
     env::apply_hostname();
