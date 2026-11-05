@@ -94,11 +94,12 @@ pub(crate) fn init_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) {
 
 pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -> RecvPkt {
     if let Some(buf) = pkt.buf_mut() {
-        let peer_credit = proxy.peer_avail_credit();
-        let max_len = std::cmp::min(buf.len(), peer_credit);
-        if max_len == 0 {
-            return RecvPkt::WaitForCredit;
-        }
+        // UDP credit accounting is disabled here for the same reason it is on
+        // the unix side: the guest kernel never returns credit for a datagram
+        // socket, so honouring it strands every reply. Asking for credit that
+        // will not come also parks the socket on an empty polling interest,
+        // which is why a DNS reply was dropped rather than merely delayed.
+        let max_len = buf.len();
 
         let res = unsafe { recv(sock(proxy), buf.as_mut_ptr() as _, max_len as i32, 0) };
 
@@ -108,11 +109,18 @@ pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -
             RecvPkt::Close
         } else {
             let err = unsafe { WSAGetLastError() };
-            if err == WSAEWOULDBLOCK {
-                RecvPkt::WaitForCredit
-            } else {
-                RecvPkt::Error
+            if err != WSAEWOULDBLOCK {
+                debug!("dgram recv error: id={} err={err}", proxy.id);
             }
+            // WOULDBLOCK means the socket is drained, which is how this loop
+            // ends every time it succeeds -- not that the guest owes us credit.
+            // Reporting it as the latter made the muxer disarm the socket after
+            // each read, and this epoll is WSAEventSelect-backed: re-arming does
+            // not re-announce a datagram that landed while the interest was
+            // off. The reply to the next query then went missing, which is how
+            // a DNS lookup fails at random. The unix side answers `Error` here
+            // for the same reason.
+            RecvPkt::Error
         }
     } else {
         RecvPkt::Error
