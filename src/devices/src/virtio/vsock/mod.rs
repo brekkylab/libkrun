@@ -12,6 +12,7 @@ mod muxer_rxq;
 mod muxer_thread;
 #[allow(dead_code)]
 mod packet;
+mod policy;
 mod proxy;
 mod reaper;
 #[cfg(target_os = "macos")]
@@ -26,6 +27,7 @@ mod windows;
 pub use self::defs::TsiFlags;
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
 pub use self::device::Vsock;
+pub use self::policy::TsiPolicy;
 
 use bitflags::bitflags;
 use vm_memory::GuestMemoryError;

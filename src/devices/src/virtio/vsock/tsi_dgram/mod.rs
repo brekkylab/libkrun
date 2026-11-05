@@ -132,6 +132,10 @@ impl Proxy for TsiDgramProxy {
         sys::do_sendto_addr(self, req)
     }
 
+    fn refuse_sendto(&mut self) {
+        self.sendto_addr = None;
+    }
+
     fn sendto_data(&mut self, pkt: &VsockPacket) {
         sys::sendto_data(self, pkt)
     }
