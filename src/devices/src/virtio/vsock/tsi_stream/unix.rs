@@ -446,11 +446,19 @@ pub(crate) fn do_accept(proxy: &mut super::TsiStreamProxy, req: TsiAcceptReq) ->
 
     let mut update = ProxyUpdate::default();
 
+    // The flags are the guest's `f_flags`, so the bit is Linux's whatever the host is -- on
+    // macOS `libc::O_NONBLOCK` is 0x4, and a non-blocking accept taken for a blocking one
+    // leaves the guest waiting on an answer that comes only with the next connection.
+    const LINUX_O_NONBLOCK: u32 = 0o4000;
+
     if proxy.pending_accepts > 0 {
         proxy.pending_accepts -= 1;
         proxy.push_accept_rsp(0);
         update.signal_queue = true;
-    } else if (req.flags & libc::O_NONBLOCK as u32) != 0 {
+    } else if (req.flags & LINUX_O_NONBLOCK) != 0 {
+        #[cfg(target_os = "macos")]
+        proxy.push_accept_rsp(-linux_errno_raw(libc::EWOULDBLOCK));
+        #[cfg(target_os = "linux")]
         proxy.push_accept_rsp(-libc::EWOULDBLOCK);
         update.signal_queue = true;
     } else {
@@ -547,6 +555,9 @@ pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) 
     {
         debug!("process_event: HANG_UP");
         if proxy.status == ProxyStatus::Connecting {
+            #[cfg(target_os = "macos")]
+            proxy.push_connect_rsp(-linux_errno_raw(libc::ECONNREFUSED));
+            #[cfg(target_os = "linux")]
             proxy.push_connect_rsp(-libc::ECONNREFUSED);
         } else {
             proxy.push_reset();

@@ -34,6 +34,22 @@ pub fn setup_network(iface: &str, dhcp: bool, dhcp_renew: bool) {
     }
 
     setup_dhcp(iface, sock.as_raw_fd(), dhcp, dhcp_renew);
+    setup_nameserver();
+}
+
+/// Write `/etc/resolv.conf` naming `KRUN_NAMESERVER`, for a guest whose network has no DHCP
+/// to say what its resolver is -- TSI, where a socket is the host's and there is no lease.
+///
+/// After the root is in place, like DHCP's own write: the file belongs to the root the
+/// workload sees.
+#[cfg(target_os = "linux")]
+fn setup_nameserver() {
+    let Ok(nameserver) = std::env::var("KRUN_NAMESERVER") else {
+        return;
+    };
+    if let Err(e) = std::fs::write("/etc/resolv.conf", format!("nameserver {nameserver}\n")) {
+        eprintln!("Warning: couldn't write /etc/resolv.conf: {e}");
+    }
 }
 
 #[cfg(target_os = "freebsd")]

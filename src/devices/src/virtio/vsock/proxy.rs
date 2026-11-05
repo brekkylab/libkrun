@@ -95,6 +95,9 @@ pub trait Proxy: Send + AsRawFd {
     fn getpeername(&mut self, pkt: &VsockPacket);
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
     fn sendto_addr(&mut self, req: TsiSendtoAddr) -> ProxyUpdate;
+    /// Forget where datagrams were going, so that data following a destination a policy
+    /// refused is dropped rather than sent wherever the one before it went.
+    fn refuse_sendto(&mut self) {}
     fn sendto_data(&mut self, _pkt: &VsockPacket) {}
     fn listen(
         &mut self,

@@ -14,6 +14,7 @@ use super::defs::uapi;
 use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::muxer_thread::MuxerThread;
 use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
+use super::policy::TsiPolicy;
 use super::proxy::{Proxy, ProxyRemoval, ProxyUpdate};
 use super::reaper::ReaperThread;
 #[cfg(target_os = "macos")]
@@ -26,7 +27,8 @@ use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 
 use crate::virtio::InterruptTransport;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use crate::virtio::linux_errno::{LINUX_ECONNREFUSED, LINUX_EPERM};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 #[cfg(windows)]
 use defs::{LINUX_AF_INET as AF_INET, LINUX_AF_INET6 as AF_INET6, LINUX_AF_UNIX as AF_UNIX};
@@ -116,6 +118,7 @@ pub struct VsockMuxer {
     reaper_sender: Option<Sender<u64>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     tsi_flags: TsiFlags,
+    policy: Option<Arc<dyn TsiPolicy>>,
 }
 
 impl VsockMuxer {
@@ -124,6 +127,7 @@ impl VsockMuxer {
         host_port_map: Option<HashMap<u16, u16>>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
         tsi_flags: TsiFlags,
+        policy: Option<Arc<dyn TsiPolicy>>,
     ) -> Self {
         VsockMuxer {
             cid,
@@ -137,6 +141,7 @@ impl VsockMuxer {
             reaper_sender: None,
             unix_ipc_port_map,
             tsi_flags,
+            policy,
         }
     }
 
@@ -382,9 +387,25 @@ impl VsockMuxer {
 
     fn process_connect(&self, pkt: &VsockPacket) {
         debug!("proxy connect request");
-        if let Some(req) = pkt.read_connect_req() {
+        if let Some(mut req) = pkt.read_connect_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("proxy connect request: id={id}");
+            if let Some(to) = inet(&req.addr)
+                && let Some(policy) = &self.policy
+            {
+                match policy.connect(to) {
+                    Some(to) => req.addr = storage(to),
+                    None => {
+                        debug!("proxy connect request: id={id} refused by policy");
+                        self.push_packet(MuxerRx::ConnResponse {
+                            local_port: pkt.dst_port(),
+                            peer_port: pkt.src_port(),
+                            result: -LINUX_ECONNREFUSED,
+                        });
+                        return;
+                    }
+                }
+            }
             match self.proxy_map.read().unwrap().get(&id) {
                 Some(proxy) => {
                     self.process_proxy_update(id, proxy.lock().unwrap().connect(pkt, req));
@@ -424,9 +445,23 @@ impl VsockMuxer {
 
     fn process_sendto_addr(&self, pkt: &VsockPacket) {
         debug!("new DGRAM sendto addr: src={}", pkt.src_port());
-        if let Some(req) = pkt.read_sendto_addr() {
+        if let Some(mut req) = pkt.read_sendto_addr() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("new DGRAM sendto addr: id={id}");
+            if let Some(to) = inet(&req.addr)
+                && let Some(policy) = &self.policy
+            {
+                match policy.connect(to) {
+                    Some(to) => req.addr = storage(to),
+                    None => {
+                        debug!("new DGRAM sendto addr: id={id} refused by policy");
+                        if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
+                            proxy.lock().unwrap().refuse_sendto();
+                        }
+                        return;
+                    }
+                }
+            }
             let update = self
                 .proxy_map
                 .read()
@@ -450,9 +485,25 @@ impl VsockMuxer {
 
     fn process_listen_request(&self, pkt: &VsockPacket) {
         debug!("DGRAM listen request: src={}", pkt.src_port());
-        if let Some(req) = pkt.read_listen_req() {
+        if let Some(mut req) = pkt.read_listen_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("DGRAM listen request: id={id}");
+            if let Some(at) = inet(&req.addr)
+                && let Some(policy) = &self.policy
+            {
+                match policy.listen(at) {
+                    Some(at) => req.addr = storage(at),
+                    None => {
+                        debug!("DGRAM listen request: id={id} kept in the guest by policy");
+                        self.push_packet(MuxerRx::ListenResponse {
+                            local_port: pkt.dst_port(),
+                            peer_port: pkt.src_port(),
+                            result: -LINUX_EPERM,
+                        });
+                        return;
+                    }
+                }
+            }
             match self.proxy_map.read().unwrap().get(&id) {
                 Some(proxy) => self.process_proxy_update(
                     id,
@@ -751,3 +802,34 @@ impl VsockMuxer {
         Ok(())
     }
 }
+
+/// The address a request names, when it is one a [`TsiPolicy`] is asked about -- an IPv4 or
+/// IPv6 one, and not a path.
+#[cfg(unix)]
+fn inet(addr: &Storage) -> Option<SocketAddr> {
+    if let Some(v4) = addr.as_sockaddr_in() {
+        return Some(SocketAddr::V4((*v4).into()));
+    }
+    addr.as_sockaddr_in6()
+        .map(|v6| SocketAddr::V6((*v6).into()))
+}
+
+#[cfg(windows)]
+fn inet(addr: &Storage) -> Option<SocketAddr> {
+    addr.to_std_v4()
+        .map(SocketAddr::V4)
+        .or_else(|| addr.to_std_v6().map(SocketAddr::V6))
+}
+
+/// The address a [`TsiPolicy`] answered, as a request carries one.
+fn storage(addr: SocketAddr) -> Storage {
+    match addr {
+        SocketAddr::V4(v4) => v4.into(),
+        SocketAddr::V6(v6) => v6.into(),
+    }
+}
+
+#[cfg(windows)]
+use super::windows::sockaddr_storage::SockaddrStorage as Storage;
+#[cfg(unix)]
+use nix::sys::socket::SockaddrStorage as Storage;

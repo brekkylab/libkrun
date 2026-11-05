@@ -52,6 +52,7 @@ pub use device_builders::{ConsoleBuilder, ConsoleDevice};
 pub use device_builders::{DisplayBackend, DisplayInfoBuilder};
 #[cfg(feature = "gpu")]
 pub use device_builders::{GpuDevice, VirglRendererFlags};
+pub use devices::virtio::TsiPolicy;
 #[cfg(not(feature = "tee"))]
 pub use devices::virtio::balloon::FreePageReportingMode;
 #[cfg(feature = "blk")]

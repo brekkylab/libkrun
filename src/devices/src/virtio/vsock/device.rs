@@ -55,10 +55,11 @@ impl Vsock {
         host_port_map: Option<HashMap<u16, u16>>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
         tsi_flags: TsiFlags,
+        policy: Option<Arc<dyn super::TsiPolicy>>,
     ) -> super::Result<Vsock> {
         Ok(Vsock {
             cid,
-            muxer: VsockMuxer::new(cid, host_port_map, unix_ipc_port_map, tsi_flags),
+            muxer: VsockMuxer::new(cid, host_port_map, unix_ipc_port_map, tsi_flags, policy),
             queue_rx: None,
             queue_tx: None,
             queue_events: Vec::new(),

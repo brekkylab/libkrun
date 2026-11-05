@@ -1,6 +1,6 @@
 #![allow(unused)]
 
-const LINUX_EPERM: i32 = 1;
+pub const LINUX_EPERM: i32 = 1;
 const LINUX_ENOENT: i32 = 2;
 const LINUX_ESRCH: i32 = 3;
 const LINUX_EINTR: i32 = 4;
@@ -75,7 +75,7 @@ const LINUX_ENOTCONN: i32 = 107;
 const LINUX_ESHUTDOWN: i32 = 108;
 const LINUX_ETOOMANYREFS: i32 = 109;
 const LINUX_ETIMEDOUT: i32 = 110;
-const LINUX_ECONNREFUSED: i32 = 111;
+pub const LINUX_ECONNREFUSED: i32 = 111;
 const LINUX_EHOSTDOWN: i32 = 112;
 const LINUX_EHOSTUNREACH: i32 = 113;
 const LINUX_EALREADY: i32 = 114;

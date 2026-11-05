@@ -1354,6 +1354,7 @@ pub struct VsockDevice {
     tsi_flags: devices::virtio::TsiFlags,
     host_port_map: HashMap<u16, u16>,
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+    policy: Option<Arc<dyn devices::virtio::TsiPolicy>>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export)]
@@ -1368,6 +1369,7 @@ impl VsockDevice {
             tsi_flags,
             host_port_map: HashMap::new(),
             unix_ipc_port_map: HashMap::new(),
+            policy: None,
         })
     }
 
@@ -1389,6 +1391,16 @@ impl VsockDevice {
     }
 }
 
+impl VsockDevice {
+    /// Decide where the guest's impersonated sockets may go -- see [`TsiPolicy`]. Without
+    /// one, every request goes where the guest asked.
+    ///
+    /// [`TsiPolicy`]: devices::virtio::TsiPolicy
+    pub fn set_policy(&mut self, policy: Arc<dyn devices::virtio::TsiPolicy>) {
+        self.policy = Some(policy);
+    }
+}
+
 #[cfg_attr(feature = "ffi", ffier::export)]
 impl<'a> AttachDevice<'a> for VsockDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
@@ -1397,9 +1409,14 @@ impl<'a> AttachDevice<'a> for VsockDevice {
         let unix_ipc_port_map =
             (!self.unix_ipc_port_map.is_empty()).then_some(self.unix_ipc_port_map);
 
-        let vsock =
-            devices::virtio::Vsock::new(self.cid, host_port_map, unix_ipc_port_map, self.tsi_flags)
-                .map_err(|e| VmmError::Internal(format!("vsock: {e:?}")))?;
+        let vsock = devices::virtio::Vsock::new(
+            self.cid,
+            host_port_map,
+            unix_ipc_port_map,
+            self.tsi_flags,
+            self.policy,
+        )
+        .map_err(|e| VmmError::Internal(format!("vsock: {e:?}")))?;
 
         let inner = Arc::new(Mutex::new(vsock));
         ctx.subscribe_events(inner.clone())?;
