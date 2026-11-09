@@ -1459,6 +1459,7 @@ pub struct BlockDevice {
     is_read_only: bool,
     direct_io: bool,
     sync_mode: SyncMode,
+    storage: Option<Box<dyn devices::virtio::DynStorage>>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
@@ -1476,7 +1477,22 @@ impl BlockDevice {
             is_read_only: false,
             direct_io: false,
             sync_mode: SyncMode::default(),
+            storage: None,
         })
+    }
+
+    /// As [`new`](Self::new), the image read and written through `storage` instead of the file
+    /// at `disk_image_path` opened plainly -- a disk whose data is fetched as it is read, say.
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    pub fn with_storage(
+        id: &str,
+        disk_image_path: &str,
+        format: DiskFormat,
+        storage: Box<dyn devices::virtio::DynStorage>,
+    ) -> Result<Self, VmmError> {
+        let mut device = Self::new(id, disk_image_path, format)?;
+        device.storage = Some(storage);
+        Ok(device)
     }
 
     /// Set whether the block device is read-only.
@@ -1514,6 +1530,7 @@ impl<'a> AttachDevice<'a> for BlockDevice {
             self.is_read_only,
             self.direct_io,
             self.sync_mode,
+            self.storage,
         )
         .map_err(|e| VmmError::Internal(format!("block: {e}")))?;
 

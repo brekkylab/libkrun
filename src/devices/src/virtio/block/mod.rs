@@ -8,6 +8,9 @@ mod worker;
 
 #[cfg(feature = "blk")]
 pub use self::device::{Block, CacheType};
+/// What a [`Block`] may read and write its image through, in place of its file.
+#[cfg(feature = "blk")]
+pub use imago::DynStorage;
 
 use vm_memory::GuestMemoryError;
 

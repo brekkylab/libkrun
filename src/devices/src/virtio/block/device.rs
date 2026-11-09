@@ -264,7 +264,8 @@ pub struct Block {
 impl Block {
     /// Create a new virtio block device that operates on the given file.
     ///
-    /// The given file must be seekable and sizable.
+    /// The given file must be seekable and sizable. With `storage`, the image is read and
+    /// written through it instead of the file opened plainly: the file names the disk still.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
@@ -275,6 +276,7 @@ impl Block {
         is_disk_read_only: bool,
         direct_io: bool,
         sync_mode: SyncMode,
+        storage: Option<Box<dyn DynStorage>>,
     ) -> io::Result<Block> {
         let disk_image = OpenOptions::new()
             .read(true)
@@ -290,14 +292,17 @@ impl Block {
 
         #[cfg(target_os = "macos")]
         let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
-        let file = ImagoFile::open(file_opts)?;
-        let discard_alignment = file.discard_align();
+        let file: Box<dyn DynStorage> = match storage {
+            Some(storage) => storage,
+            None => Box::new(ImagoFile::open(file_opts)?),
+        };
+        let discard_alignment = file.dyn_discard_align();
 
         let disk_image = match disk_image_format {
             DiskFormat::Qcow2 => {
                 let mut qcow2 =
                     Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image(
-                        Box::new(file),
+                        file,
                         !is_disk_read_only,
                     )?;
                 qcow2.open_implicit_dependencies()?;
@@ -305,12 +310,12 @@ impl Block {
             }
             DiskFormat::Raw => {
                 let raw =
-                    Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), !is_disk_read_only)?;
+                    Raw::<Box<dyn DynStorage>>::open_image(file, !is_disk_read_only)?;
                 FormatAccess::new(raw)
             }
             DiskFormat::Vmdk => {
                 let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
-                    Box::new(file),
+                    file,
                 )
                 .open(PermissiveImplicitOpenGate::default())?;
                 FormatAccess::new(vmdk)

@@ -21,7 +21,7 @@ pub fn default_block() -> Block {
 pub fn default_block_with_path(path: String) -> Block {
     let id = "test".to_string();
     // The default block device is read-write and non-root.
-    Block::new(id, None, CacheType::Unsafe, path, false, false).unwrap()
+    Block::new(id, None, CacheType::Unsafe, path, false, false, None).unwrap()
 }
 
 pub fn invoke_handler_for_queue_event(b: &mut Block) {
