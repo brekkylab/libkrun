@@ -583,11 +583,21 @@ pub enum Payload {
         not(feature = "tee"),
         not(target_os = "windows")
     ))]
+    #[cfg_attr(
+        all(target_os = "linux", not(feature = "vhost-user")),
+        allow(dead_code)
+    )]
     KernelMmap,
     #[cfg(any(
         target_arch = "aarch64",
         target_arch = "riscv64",
-        target_os = "windows"
+        target_os = "windows",
+        all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(feature = "tee"),
+            not(feature = "vhost-user")
+        )
     ))]
     KernelCopy,
     #[cfg(not(target_os = "windows"))]
@@ -631,8 +641,25 @@ pub fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrov
         #[cfg(feature = "tee")]
         return Ok(Payload::Tee);
 
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        // Copied into the guest's memory, where huge pages back it, rather than mapped from
+        // libkrunfw's file pages: under nested virtualization each 4K page of those is a fault
+        // to the outer hypervisor the first time the guest touches it, some 240 ms of a 490 ms
+        // boot on an EC2 node. vhost-user's devices share the kernel's memory, which takes the
+        // mapping.
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(feature = "tee"),
+            feature = "vhost-user"
+        ))]
         return Ok(Payload::KernelMmap);
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(feature = "tee"),
+            not(feature = "vhost-user")
+        ))]
+        return Ok(Payload::KernelCopy);
 
         #[cfg(any(
             target_arch = "aarch64",
@@ -1686,7 +1713,13 @@ pub fn load_payload(
         #[cfg(any(
             target_arch = "aarch64",
             target_arch = "riscv64",
-            target_os = "windows"
+            target_os = "windows",
+            all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                not(feature = "tee"),
+                not(feature = "vhost-user")
+            )
         ))]
         Payload::KernelCopy => {
             let (kernel_entry_addr, kernel_host_addr, kernel_guest_addr, kernel_size) =
@@ -1965,7 +1998,14 @@ pub fn create_guest_memory(
             let fw: Option<(u64, usize)> = None;
             arch::arch_memory_regions(mem_size, None, 0, external_kernel.initramfs_size, fw)
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(
+            target_os = "windows",
+            all(
+                target_os = "linux",
+                not(feature = "tee"),
+                not(feature = "vhost-user")
+            )
+        ))]
         Payload::KernelCopy => arch::arch_memory_regions(mem_size, None, 0, 0, None),
         #[cfg(feature = "tee")]
         Payload::Tee => {
