@@ -15,7 +15,7 @@ use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::muxer_thread::MuxerThread;
 use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
 use super::policy::TsiPolicy;
-use super::proxy::{Proxy, ProxyRemoval, ProxyUpdate};
+use super::proxy::{Proxy, ProxyRemoval, ProxyStatus, ProxyUpdate};
 use super::reaper::ReaperThread;
 #[cfg(target_os = "macos")]
 use super::timesync::TimesyncThread;
@@ -488,7 +488,18 @@ impl VsockMuxer {
         if let Some(mut req) = pkt.read_listen_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("DGRAM listen request: id={id}");
-            if let Some(at) = inet(&req.addr)
+            // A socket listening already, listened on again -- as nginx does, to set its backlog
+            // -- stays where it is: the host's socket was bound where the policy said at its
+            // first `listen`, and is not bound again. Asked again, the policy would say where
+            // it is now (another port, the first being held), and be wrong from then on.
+            let listening = self.proxy_map.read().unwrap().get(&id).is_some_and(|proxy| {
+                matches!(
+                    proxy.lock().unwrap().status(),
+                    ProxyStatus::Listening | ProxyStatus::WaitingOnAccept
+                )
+            });
+            if !listening
+                && let Some(at) = inet(&req.addr)
                 && let Some(policy) = &self.policy
             {
                 match policy.listen(at) {
