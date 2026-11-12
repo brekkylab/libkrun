@@ -144,7 +144,9 @@ impl Vm {
         })
     }
 
-    pub fn memory_init(&mut self, guest_mem: &GuestMemoryMmap) -> Result<()> {
+    /// Maps guest RAM into the partition and, with `prefault`, backs it with host pages now
+    /// (see [`WhpVm::prefault_memory`]).
+    pub fn memory_init(&mut self, guest_mem: &GuestMemoryMmap, prefault: bool) -> Result<()> {
         for region in guest_mem.iter() {
             // It's safe to unwrap because the guest address is valid.
             let host_addr = guest_mem.get_host_address(region.start_addr()).unwrap();
@@ -162,6 +164,11 @@ impl Vm {
                 )
             };
             map_result.map_err(Error::SetUserMemoryRegion)?;
+            if prefault {
+                self.whp_vm
+                    .prefault_memory(region.start_addr().raw_value(), region.len())
+                    .map_err(Error::SetUserMemoryRegion)?;
+            }
         }
         Ok(())
     }

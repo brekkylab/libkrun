@@ -920,7 +920,11 @@ pub fn build_microvm(
     )?;
     #[cfg(all(not(feature = "tee"), target_os = "windows"))]
     #[allow(unused_mut)]
-    let mut vm = setup_vm(&guest_memory, vcpu_config.vcpu_count)?;
+    let mut vm = setup_vm(
+        &guest_memory,
+        vcpu_config.vcpu_count,
+        vm_resources.prefault_memory,
+    )?;
 
     #[cfg(feature = "tee")]
     let (_kvm, vm) = {
@@ -2153,11 +2157,12 @@ pub(crate) fn setup_vm(
 pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
     vcpu_count: u8,
+    prefault_memory: bool,
 ) -> std::result::Result<Vm, StartMicrovmError> {
     let mut vm = Vm::new(vcpu_count)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
-    vm.memory_init(guest_memory)
+    vm.memory_init(guest_memory, prefault_memory)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     Ok(vm)
