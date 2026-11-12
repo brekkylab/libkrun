@@ -35,6 +35,7 @@ pub struct VmmBuilder<'a> {
     nested_virt: bool,
     reset_exit_code: Option<u8>,
     invariant_tsc: bool,
+    prefault_memory: bool,
     split_irqchip: bool,
     transparent_huge_pages: bool,
     acpi: bool,
@@ -153,6 +154,18 @@ impl<'a> VmmBuilder<'a> {
         }
         self.invariant_tsc = enabled;
         Ok(self)
+    }
+
+    /// Back all of guest RAM with host pages before the guest runs, rather than as it first
+    /// touches each.
+    ///
+    /// Only WHP heeds it, where a first touch is costly: nested -- a Windows instance in a
+    /// cloud -- it is the better part of a boot. The cost is that all of the guest's RAM is
+    /// then resident on the host from the start, used or not, so it is off by default.
+    /// Elsewhere it does nothing.
+    pub fn prefault_memory(mut self, enabled: bool) -> Self {
+        self.prefault_memory = enabled;
+        self
     }
 
     pub fn split_irqchip(mut self, enabled: bool) -> Result<Self, VmmError> {
@@ -504,6 +517,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
     vm_resources.nested_enabled = builder_cfg.nested_virt;
     vm_resources.reset_exit_code = builder_cfg.reset_exit_code;
     vm_resources.invariant_tsc = builder_cfg.invariant_tsc;
+    vm_resources.prefault_memory = builder_cfg.prefault_memory;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
     #[cfg(target_os = "linux")]
     {

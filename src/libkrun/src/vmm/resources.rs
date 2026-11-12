@@ -118,6 +118,8 @@ pub struct VmResources {
     pub reset_exit_code: Option<u8>,
     /// Whether to expose the host's invariant TSC capability.
     pub invariant_tsc: bool,
+    /// Whether to back all of guest RAM with host pages before the guest runs (WHP only).
+    pub prefault_memory: bool,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// Whether to ask for transparent huge pages for guest memory (Linux).
@@ -278,6 +280,7 @@ mod tests {
             nested_enabled: false,
             reset_exit_code: None,
             invariant_tsc: false,
+            prefault_memory: false,
             split_irqchip: false,
             #[cfg(target_os = "linux")]
             transparent_huge_pages: false,

@@ -945,6 +945,7 @@ pub fn build_microvm(
         &guest_memory,
         vcpu_config.vcpu_count,
         vm_resources.invariant_tsc,
+        vm_resources.prefault_memory,
     )?;
 
     #[cfg(feature = "tee")]
@@ -2353,11 +2354,12 @@ pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
     vcpu_count: u8,
     invariant_tsc: bool,
+    prefault_memory: bool,
 ) -> std::result::Result<Vm, StartMicrovmError> {
     let mut vm = Vm::new(vcpu_count, invariant_tsc)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
-    vm.memory_init(guest_memory)
+    vm.memory_init(guest_memory, prefault_memory)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     Ok(vm)
