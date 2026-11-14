@@ -31,6 +31,7 @@ pub struct VmmBuilder<'a> {
     serial_consoles: Vec<SerialConsoleConfig>,
     kernel_console: Option<String>,
     nested_virt: bool,
+    prefault_memory: bool,
     split_irqchip: bool,
     acpi: bool,
     smbios_oem_strings: Vec<String>,
@@ -102,6 +103,18 @@ impl<'a> VmmBuilder<'a> {
 
     pub fn nested_virt(mut self, enabled: bool) -> Self {
         self.nested_virt = enabled;
+        self
+    }
+
+    /// Back all of guest RAM with host pages before the guest runs, rather than as it first
+    /// touches each.
+    ///
+    /// Only WHP heeds it, where a first touch is costly: nested -- a Windows instance in a
+    /// cloud -- it is the better part of a boot. The cost is that all of the guest's RAM is
+    /// then resident on the host from the start, used or not, so it is off by default.
+    /// Elsewhere it does nothing.
+    pub fn prefault_memory(mut self, enabled: bool) -> Self {
+        self.prefault_memory = enabled;
         self
     }
 
@@ -413,6 +426,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
     vm_resources.kernel_cmdline.prolog = Some(payload.cmdline);
 
     vm_resources.nested_enabled = builder_cfg.nested_virt;
+    vm_resources.prefault_memory = builder_cfg.prefault_memory;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
     vm_resources.acpi_enabled = builder_cfg.acpi;
     if !builder_cfg.smbios_oem_strings.is_empty() {

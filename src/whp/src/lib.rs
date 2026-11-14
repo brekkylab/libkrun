@@ -11,28 +11,30 @@ use std::sync::Arc;
 use log::{debug, error};
 use windows_sys::Win32::Foundation::S_OK;
 use windows_sys::Win32::System::Hypervisor::{
-    WHV_CAPABILITY, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT,
-    WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY, WHV_PARTITION_PROPERTY_CODE,
-    WHV_PROCESSOR_FEATURES_BANKS, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
+    WHV_ADVISE_GPA_RANGE_POPULATE, WHV_CAPABILITY, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS,
+    WHV_MEMORY_ACCESS_CONTEXT, WHV_MEMORY_RANGE_ENTRY, WHV_PARTITION_HANDLE,
+    WHV_PARTITION_PROPERTY, WHV_PARTITION_PROPERTY_CODE, WHV_PROCESSOR_FEATURES_BANKS,
+    WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
     WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS, WHV_VP_EXIT_CONTEXT, WHV_X64_CPUID_RESULT,
-    WHV_X64_IO_PORT_ACCESS_CONTEXT, WHvCancelRunVirtualProcessor,
-    WHvCapabilityCodeHypervisorPresent, WHvCapabilityCodeProcessorFeaturesBanks,
-    WHvCapabilityCodeSyntheticProcessorFeaturesBanks, WHvCreatePartition,
-    WHvCreateVirtualProcessor, WHvDeletePartition, WHvDeleteVirtualProcessor,
+    WHV_X64_IO_PORT_ACCESS_CONTEXT, WHvAdviseGpaRange, WHvAdviseGpaRangeCodePopulate,
+    WHvCancelRunVirtualProcessor, WHvCapabilityCodeHypervisorPresent,
+    WHvCapabilityCodeProcessorFeaturesBanks, WHvCapabilityCodeSyntheticProcessorFeaturesBanks,
+    WHvCreatePartition, WHvCreateVirtualProcessor, WHvDeletePartition, WHvDeleteVirtualProcessor,
     WHvEmulatorCreateEmulator, WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation,
     WHvEmulatorTryMmioEmulation, WHvGetCapability, WHvGetVirtualProcessorRegisters, WHvMapGpaRange,
     WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
-    WHvPartitionPropertyCodeCpuidResultList, WHvPartitionPropertyCodeLocalApicEmulationMode,
-    WHvPartitionPropertyCodeProcessorCount, WHvPartitionPropertyCodeProcessorFeaturesBanks,
+    WHvMemoryAccessWrite, WHvPartitionPropertyCodeCpuidResultList,
+    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
+    WHvPartitionPropertyCodeProcessorFeaturesBanks,
     WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks, WHvRequestInterrupt,
     WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
     WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException,
     WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64ApicEoi, WHvRunVpExitReasonX64Cpuid,
     WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64InterruptWindow,
     WHvRunVpExitReasonX64IoPortAccess, WHvRunVpExitReasonX64MsrAccess, WHvSetPartitionProperty,
-    WHvSetVirtualProcessorRegisters, WHvSetupPartition, WHvUnmapGpaRange, WHvX64LocalApicEmulationModeXApic,
-    WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRax, WHvX64RegisterRbx,
-    WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
+    WHvSetVirtualProcessorRegisters, WHvSetupPartition, WHvUnmapGpaRange,
+    WHvX64LocalApicEmulationModeXApic, WHvX64RegisterDeliverabilityNotifications,
+    WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
 };
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
@@ -46,6 +48,7 @@ pub enum Error {
     DeletePartition(i32),
     MapGpaRange(i32),
     UnmapGpaRange(i32),
+    AdviseGpaRange(i32),
     RequestInterrupt(i32),
     CreateVirtualProcessor(i32),
     DeleteVirtualProcessor(i32),
@@ -74,6 +77,7 @@ impl Display for Error {
             DeletePartition(hr) => write!(f, "WHvDeletePartition failed: HRESULT 0x{hr:08x}"),
             MapGpaRange(hr) => write!(f, "WHvMapGpaRange failed: HRESULT 0x{hr:08x}"),
             UnmapGpaRange(hr) => write!(f, "WHvUnmapGpaRange failed: HRESULT 0x{hr:08x}"),
+            AdviseGpaRange(hr) => write!(f, "WHvAdviseGpaRange failed: HRESULT 0x{hr:08x}"),
             RequestInterrupt(hr) => write!(f, "WHvRequestInterrupt failed: HRESULT 0x{hr:08x}"),
             CreateVirtualProcessor(hr) => {
                 write!(f, "WHvCreateVirtualProcessor failed: HRESULT 0x{hr:08x}")
@@ -570,6 +574,43 @@ impl WhpVm {
         };
         if hr != S_OK {
             Err(Error::MapGpaRange(hr))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Backs a mapped range with host pages now, rather than one at a time as the guest
+    /// first touches each.
+    ///
+    /// A first touch is an exit the hypervisor resolves on its own, page by page; nested --
+    /// WHP on a cloud instance -- each costs a hundred microseconds or more, and a guest kernel
+    /// touches tens of thousands of pages before it reaches init. Populating does them all in
+    /// one call, at a few hundred nanoseconds a page, but every page of the range is then
+    /// resident on the host whether the guest uses it or not.
+    pub fn prefault_memory(&self, guest_start_addr: u64, size: u64) -> Result<(), Error> {
+        let range = WHV_MEMORY_RANGE_ENTRY {
+            GuestAddress: guest_start_addr,
+            SizeInBytes: size,
+        };
+        // SAFETY: plain data, all of whose fields zero is a valid value of.
+        let mut populate: WHV_ADVISE_GPA_RANGE_POPULATE = unsafe { std::mem::zeroed() };
+        // `Prefetch`: fault the pages in now, not only advise that they will be touched.
+        populate.Flags.AsUINT32 = 1;
+        // As writable: a guest's RAM is written, and a page faulted in for reading would
+        // fault again on the first write.
+        populate.AccessType = WHvMemoryAccessWrite;
+        let hr = unsafe {
+            WHvAdviseGpaRange(
+                self.handle,
+                &range,
+                1,
+                WHvAdviseGpaRangeCodePopulate,
+                &populate as *const _ as *const c_void,
+                std::mem::size_of::<WHV_ADVISE_GPA_RANGE_POPULATE>() as u32,
+            )
+        };
+        if hr != S_OK {
+            Err(Error::AdviseGpaRange(hr))
         } else {
             Ok(())
         }
