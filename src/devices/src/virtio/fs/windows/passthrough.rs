@@ -29,10 +29,10 @@ use windows_sys::Wdk::Storage::FileSystem::{
     NtQueryInformationFile, NtSetInformationFile, NtWriteFile, RtlNtStatusToDosErrorNoTeb,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_NAME, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    INVALID_HANDLE_VALUE, NTSTATUS, STATUS_BUFFER_OVERFLOW, STATUS_INVALID_INFO_CLASS,
-    STATUS_INVALID_PARAMETER, STATUS_NO_MORE_FILES, STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED,
-    UNICODE_STRING,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_CANT_RESOLVE_FILENAME, ERROR_INVALID_NAME,
+    GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, STATUS_BUFFER_OVERFLOW,
+    STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_NO_MORE_FILES,
+    STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DeleteFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
@@ -353,6 +353,13 @@ fn unix_to_filetime(secs: i64, nsec: u32) -> u64 {
 
 type FileInfo = FILE_STAT_INFORMATION;
 
+/// A reparse point is a symlink unless it is a mount point, which the guest sees as a
+/// directory.
+fn is_symlink(info: &FileInfo) -> bool {
+    info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        && info.ReparseTag != IO_REPARSE_TAG_MOUNT_POINT
+}
+
 /// `(uid, gid, mode)` as stored in the override_stat stream.
 type OverrideStat = (Option<u32>, Option<u32>, Option<u32>);
 
@@ -490,14 +497,10 @@ fn build_stat64(
     let file_attributes = info.FileAttributes;
 
     let is_directory = (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-    let is_reparse = (file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-
-    // If it's a reparse point and not a mount point, it's a symlink
-    let is_symlink = is_reparse && info.ReparseTag != IO_REPARSE_TAG_MOUNT_POINT;
 
     let mut size = info.EndOfFile;
 
-    let (base_mode, nlink) = if is_symlink {
+    let (base_mode, nlink) = if is_symlink(info) {
         if let Ok(target) = read_lx_symlink_by_handle(handle) {
             // st_size MUST match the exact length returned by readlink()
             size = target.len() as i64;
@@ -1433,6 +1436,24 @@ impl PassthroughFs {
         }
     }
 
+    /// Refuse to open a symlink for its contents, as the Linux backend does with ELOOP: Windows
+    /// opens whatever an NT symlink names. The error is the one Windows gives for a symlink loop,
+    /// which `win_err_to_linux` turns into ELOOP.
+    fn refuse_a_symlink(&self, data: &InodeData) -> io::Result<()> {
+        let flags = OpenFlags {
+            desired_access: FILE_READ_ATTRIBUTES,
+            create_disposition: FILE_OPEN,
+            create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        };
+        let handle = HandleGuard(self.open_inode(data, &flags)?);
+        if is_symlink(&get_file_info_by_handle(handle.as_raw())?) {
+            return Err(io::Error::from_raw_os_error(
+                ERROR_CANT_RESOLVE_FILENAME as i32,
+            ));
+        }
+        Ok(())
+    }
+
     fn inode_path(&self, inode: Inode) -> io::Result<Arc<PathBuf>> {
         Ok(self.inode_data(inode)?.get_path())
     }
@@ -1701,6 +1722,7 @@ impl PassthroughFs {
         }
 
         let data = self.inode_data(inode)?;
+        self.refuse_a_symlink(&data).map_err(win_err_to_linux)?;
         let h = self.open_inode(&data, &oflags).map_err(win_err_to_linux)?;
 
         if kill_priv && matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
@@ -1792,6 +1814,7 @@ impl PassthroughFs {
         }
 
         let data = self.inode_data(inode)?;
+        self.refuse_a_symlink(&data)?;
         let flags = OpenFlags {
             desired_access,
             create_disposition: FILE_OPEN,
@@ -2376,6 +2399,14 @@ impl FileSystem for PassthroughFs {
 
         let mut info = get_file_info_by_handle(h).map_err(win_err_to_linux)?;
         let mut changed = false;
+
+        // The handle is the link's own, so a truncate would size the link rather than fail, where
+        // the Linux backend answers ELOOP.
+        if valid.contains(SetattrValid::SIZE) && is_symlink(&info) {
+            return Err(win_err_to_linux(io::Error::from_raw_os_error(
+                ERROR_CANT_RESOLVE_FILENAME as i32,
+            )));
+        }
 
         // Truncating to the current size is a no-op
         if valid.contains(SetattrValid::SIZE) && info.EndOfFile != attr.st_size {
@@ -3781,5 +3812,59 @@ mod tests {
         let link = fs.lookup(CTX, fuse::ROOT_ID, c"link").unwrap().inode;
 
         a_change_lands_on_the_link(&fs, link, &share.root.join("sub").join("inside.txt"));
+    }
+
+    /// Open the symlink `link` for its contents and truncate it, with a handle and without one,
+    /// then check each was refused and left `target`, the file the link names, as it was.
+    fn a_symlink_is_not_opened(fs: &PassthroughFs, link: Inode, target: &Path) {
+        let eloop = || io::Error::from_raw_os_error(linux_errno_raw(libc::ELOOP));
+        refused(
+            fs.open(CTX, link, false, libc::O_RDWR as u32),
+            eloop(),
+            "a symlink was opened for its contents",
+        );
+        let mut size: stat64 = unsafe { mem::zeroed() };
+        size.st_size = 0;
+        refused(
+            fs.setattr(CTX, link, size, None, SetattrValid::SIZE),
+            eloop(),
+            "a symlink was truncated",
+        );
+        refused(
+            fs.lseek(CTX, link, 0, 0, libc::SEEK_END as u32),
+            eloop(),
+            "a symlink was reopened for a request with no handle",
+        );
+        assert_eq!(fs::read(target).unwrap(), b"shared");
+    }
+
+    #[test]
+    fn a_symlink_is_not_opened_for_its_contents() {
+        let share = Share::new("symlink-open");
+        let fs = share.served();
+        let link = fs
+            .symlink(
+                CTX,
+                c"sub/inside.txt",
+                fuse::ROOT_ID,
+                c"link",
+                Extensions::default(),
+            )
+            .unwrap()
+            .inode;
+
+        a_symlink_is_not_opened(&fs, link, &share.root.join("sub").join("inside.txt"));
+    }
+
+    #[test]
+    fn a_symlink_the_host_made_is_not_opened_for_its_contents() {
+        let share = Share::new("host-symlink-open");
+        if !host_symlink(&share) {
+            return;
+        }
+        let fs = share.served();
+        let link = fs.lookup(CTX, fuse::ROOT_ID, c"link").unwrap().inode;
+
+        a_symlink_is_not_opened(&fs, link, &share.root.join("sub").join("inside.txt"));
     }
 }
