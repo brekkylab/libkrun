@@ -27,8 +27,8 @@ use windows_sys::Wdk::Storage::FileSystem::{
     NtQueryInformationFile, NtSetInformationFile, NtWriteFile, RtlNtStatusToDosErrorNoTeb,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
-    STATUS_NO_MORE_FILES, UNICODE_STRING,
+    CloseHandle, ERROR_INVALID_NAME, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    NTSTATUS, STATUS_NO_MORE_FILES, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, DeleteFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
@@ -304,6 +304,29 @@ fn path_to_wide(p: &Path) -> Vec<u16> {
 
 fn cstr_to_path(name: &CStr) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(name.to_bytes()).as_ref())
+}
+
+/// Refuse a name a request carried that is not a single entry of a directory.
+///
+/// Windows reads `\` as a path separator, and `Path::join` keeps only the drive of a name that
+/// has a root, so a name holding one reaches an entry the request did not name — one outside
+/// the shared directory at that. A `:` names an alternate data stream of another entry rather
+/// than an entry of its own.
+fn check_name(name: &CStr) -> io::Result<()> {
+    let bytes = name.to_bytes();
+    if bytes.is_empty()
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.iter().any(|b| matches!(b, b'\\' | b'/' | b':'))
+    {
+        return Err(einval());
+    }
+    Ok(())
+}
+
+fn child_path(parent: &Path, name: &CStr) -> io::Result<PathBuf> {
+    check_name(name)?;
+    Ok(parent.join(cstr_to_path(name)))
 }
 
 const FILETIME_UNIX_EPOCH_DIFF: i64 = 116_444_736_000_000_000;
@@ -1073,6 +1096,11 @@ fn open_by_id(root_handle: HANDLE, file_index: u64, flags: &OpenFlags) -> io::Re
 
 /// Open a child entry relative to a parent handle by name.
 fn open_relative(parent_handle: HANDLE, name: &CStr, flags: &OpenFlags) -> io::Result<HANDLE> {
+    // The callers pass this function's errors through win_err_to_linux, so a refused name is
+    // reported as the Windows code that it maps to EINVAL.
+    if check_name(name).is_err() {
+        return Err(io::Error::from_raw_os_error(ERROR_INVALID_NAME as i32));
+    }
     let name_path = cstr_to_path(name);
     let mut wide: Vec<u16> = name_path.as_os_str().encode_wide().collect();
     wide.push(0);
@@ -1345,8 +1373,7 @@ impl PassthroughFs {
             });
         }
         let parent_data = self.inode_data(parent)?;
-        let child_name = cstr_to_path(name);
-        let child_path = parent_data.get_path().join(&child_name);
+        let child_path = child_path(parent_data.get_path().as_path(), name)?;
 
         let flags = OpenFlags {
             desired_access: FILE_READ_ATTRIBUTES,
@@ -1847,11 +1874,6 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        // Colon is used to define a stream name in the ADS, so we need to prevent it from being used in the filename
-        if name.to_bytes().contains(&b':') {
-            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
-        }
-
         let parent_data = self.inode_data(parent)?;
         let root_h = *self.root_handle.read().unwrap();
         let parent_g = HandleGuard(
@@ -2232,13 +2254,8 @@ impl FileSystem for PassthroughFs {
         name: &CStr,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        // Colon is used to define a stream name in the ADS, so we need to prevent it from being used in the filename
-        if name.to_bytes().contains(&b':') {
-            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
-        }
-
         let parent_path = self.inode_path(parent)?;
-        let link_path = parent_path.join(cstr_to_path(name));
+        let link_path = child_path(parent_path.as_path(), name)?;
 
         // The target is stored exactly as the guest gave it -- an unterminated
         // Linux path, never translated to a Windows one. Nothing on the host
@@ -2271,11 +2288,6 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        // Colon is used to define a stream name in the ADS, so we need to prevent it from being used in the filename
-        if name.to_bytes().contains(&b':') {
-            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
-        }
-
         let parent_data = self.inode_data(parent)?;
         let root_h = *self.root_handle.read().unwrap();
 
@@ -2372,8 +2384,8 @@ impl FileSystem for PassthroughFs {
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
-        let old_path = self.inode_path(olddir)?.join(cstr_to_path(oldname));
-        let new_path = self.inode_path(newdir)?.join(cstr_to_path(newname));
+        let old_path = child_path(self.inode_path(olddir)?.as_path(), oldname)?;
+        let new_path = child_path(self.inode_path(newdir)?.as_path(), newname)?;
 
         // RENAME_EXCHANGE (Swap two files)
         if (flags as i32 & LINUX_RENAME_EXCHANGE) != 0 {
@@ -2421,7 +2433,7 @@ impl FileSystem for PassthroughFs {
         newname: &CStr,
     ) -> io::Result<Entry> {
         let existing = self.inode_path(inode)?;
-        let new_path = self.inode_path(newparent)?.join(cstr_to_path(newname));
+        let new_path = child_path(self.inode_path(newparent)?.as_path(), newname)?;
 
         // Note: fs::hard_link wraps CreateHardLinkW. If the target already exists,
         // it fails with an error that win_err_to_linux perfectly maps to EEXIST.
@@ -2465,13 +2477,8 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
-        // Colon is used to define a stream name in the ADS, so we need to prevent it from being used in the filename
-        if name.to_bytes().contains(&b':') {
-            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
-        }
-
         let parent_path = self.inode_path(parent)?;
-        let child_path = parent_path.join(cstr_to_path(name));
+        let child_path = child_path(parent_path.as_path(), name)?;
 
         let wb = self.writeback.load(Ordering::Relaxed);
         let oflags = parse_linux_open_flags(flags as i32 | LINUX_O_CREAT, wb);
@@ -3011,5 +3018,133 @@ impl FileSystem for PassthroughFs {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+    use std::ffi::CString;
+    use std::process;
+
+    use super::*;
+
+    const CTX: Context = Context {
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    };
+
+    /// A shared directory holding one entry, with a file beside the share that no name
+    /// of an entry can reach. Taken down with everything under it when a test ends.
+    struct Share {
+        base: PathBuf,
+        root: PathBuf,
+        outside: PathBuf,
+    }
+
+    impl Share {
+        fn new(tag: &str) -> Share {
+            let base = env::temp_dir().join(format!("libkrun-fs-{tag}-{}", process::id()));
+            let root = base.join("share");
+            let outside = base.join("outside.txt");
+            let _ = fs::remove_dir_all(&base);
+            fs::create_dir_all(root.join("sub")).unwrap();
+            fs::write(root.join("sub").join("inside.txt"), b"shared").unwrap();
+            fs::write(&outside, b"host").unwrap();
+            Share {
+                base,
+                root,
+                outside,
+            }
+        }
+
+        fn served(&self) -> PassthroughFs {
+            let cfg = Config {
+                root_dir: self.root.to_str().unwrap().to_owned(),
+                ..Default::default()
+            };
+            let fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
+            fs.init(FsOptions::empty()).unwrap();
+            fs
+        }
+    }
+
+    impl Drop for Share {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn name_of(path: &Path) -> CString {
+        CString::new(path.to_str().unwrap()).unwrap()
+    }
+
+    fn refused(result: io::Result<impl Sized>, what: &str) {
+        match result {
+            Ok(_) => panic!("{what}"),
+            Err(e) => assert_eq!(e.raw_os_error(), einval().raw_os_error(), "{what}: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_not_one_entry_is_refused() {
+        for name in [c"a\\b", c"a/b", c"a:b", c"\\Windows", c"..", c".", c""] {
+            assert!(check_name(name).is_err(), "{name:?}");
+        }
+        assert!(check_name(c"a").is_ok());
+    }
+
+    #[test]
+    fn a_lookup_stays_within_the_shared_directory() {
+        let share = Share::new("lookup");
+        let fs = share.served();
+
+        refused(
+            fs.lookup(CTX, fuse::ROOT_ID, c"sub\\inside.txt"),
+            "a separator in a name reached an entry of another directory",
+        );
+        refused(
+            fs.lookup(CTX, fuse::ROOT_ID, &name_of(&share.outside)),
+            "a name spelling a host path reached a file outside the share",
+        );
+    }
+
+    #[test]
+    fn an_unlink_stays_within_the_directory_it_names() {
+        let share = Share::new("unlink");
+        let fs = share.served();
+
+        refused(
+            fs.unlink(CTX, fuse::ROOT_ID, c"sub\\inside.txt"),
+            "a separator in a name removed an entry of another directory",
+        );
+        assert_eq!(
+            fs::read(share.root.join("sub").join("inside.txt")).unwrap(),
+            b"shared"
+        );
+    }
+
+    #[test]
+    fn a_create_stays_within_the_shared_directory() {
+        let share = Share::new("create");
+        let fs = share.served();
+        let made = share.base.join("made.txt");
+
+        refused(
+            fs.create(
+                CTX,
+                fuse::ROOT_ID,
+                &name_of(&made),
+                0o644,
+                false,
+                LINUX_O_CREAT as u32,
+                0,
+                Extensions::default(),
+            ),
+            "a name spelling a host path created a file outside the share",
+        );
+        assert!(!made.exists());
+        assert_eq!(fs::read(&share.outside).unwrap(), b"host");
     }
 }
