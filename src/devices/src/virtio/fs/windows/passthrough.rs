@@ -7,6 +7,7 @@ pub use super::super::{CachePolicy, PermissionSemantics};
 use std::collections::BTreeMap;
 use std::ffi::{CStr, OsString};
 use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::mem::{self, ManuallyDrop};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{FromRawHandle, RawHandle};
@@ -699,8 +700,7 @@ fn ads_stream_path(base: &Path, stream_suffix: &str) -> PathBuf {
 }
 
 fn read_override_stat(path: &Path) -> io::Result<(Option<u32>, Option<u32>, Option<u32>)> {
-    let ads = ads_stream_path(path, OVERRIDE_STAT_STREAM);
-    let data = match fs::read(&ads) {
+    let data = match read_ads(&ads_stream_path(path, OVERRIDE_STAT_STREAM)) {
         Ok(d) => d,
         Err(_) => return Ok((None, None, None)),
     };
@@ -715,13 +715,10 @@ fn parse_override_stat(buf: &[u8]) -> io::Result<(Option<u32>, Option<u32>, Opti
     Ok((uid, gid, mode))
 }
 
-/// `symlink` selects a no-follow write, for the one caller whose target is a
-/// symlink -- the mode bits of a link have to live on the link.
 fn write_override_stat(
     path: &Path,
     owner: Option<(u32, u32)>,
     mode: Option<u32>,
-    symlink: bool,
 ) -> io::Result<()> {
     let buf = if is_valid_owner(owner)
         && let Some(m) = mode
@@ -757,12 +754,8 @@ fn write_override_stat(
         s
     };
 
-    let ads = ads_stream_path(path, OVERRIDE_STAT_STREAM);
-    if symlink {
-        write_ads_nofollow(&ads, buf.as_bytes())
-    } else {
-        fs::write(&ads, buf.as_bytes()).map_err(win_err_to_linux)
-    }
+    write_ads(&ads_stream_path(path, OVERRIDE_STAT_STREAM), buf.as_bytes())
+        .map_err(win_err_to_linux)
 }
 
 fn is_valid_owner(owner: Option<(u32, u32)>) -> bool {
@@ -854,58 +847,42 @@ fn write_ads_by_handle(file_handle: HANDLE, stream_suffix: &str, data: &[u8]) ->
     }
 }
 
-/// Write an alternate data stream without following a reparse point, so the
-/// stream lands on a symlink itself rather than on whatever it names.
+/// Open an alternate data stream of the entry a path names, never of what a reparse point
+/// there names: the owner, mode and xattrs of a symlink are the link's own.
 ///
-/// `fs::write` cannot do this for an LX symlink at all: the system has no idea
-/// how to resolve that reparse tag, so opening the stream path through Win32
-/// fails with ERROR_CANT_ACCESS_FILE rather than reaching the target.
-fn write_ads_nofollow(ads: &Path, data: &[u8]) -> io::Result<()> {
+/// `fs::read` and `fs::write` cannot do this, as they resolve a symlink before its stream. An
+/// NT symlink resolves to its target, so they reach the target's stream, and an LX symlink does
+/// not resolve through Win32 at all, so they fail with ERROR_CANT_ACCESS_FILE.
+fn open_ads(ads: &Path, desired_access: u32, create_disposition: u32) -> io::Result<File> {
     let handle = open_handle(
         ads,
         &OpenFlags {
-            desired_access: GENERIC_WRITE,
-            create_disposition: FILE_OVERWRITE_IF,
+            desired_access,
+            create_disposition,
             create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
         },
-    )
-    .map_err(win_err_to_linux)?;
+    )?;
+    Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
+}
 
-    let mut iosb: IO_STATUS_BLOCK = unsafe { mem::zeroed() };
-    let status = unsafe {
-        NtWriteFile(
-            handle,
-            std::ptr::null_mut(),
-            None,
-            std::ptr::null(),
-            &mut iosb,
-            data.as_ptr() as *const core::ffi::c_void,
-            data.len() as u32,
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    unsafe { CloseHandle(handle) };
+fn read_ads(ads: &Path) -> io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    open_ads(ads, GENERIC_READ, FILE_OPEN)?.read_to_end(&mut data)?;
+    Ok(data)
+}
 
-    if status >= 0 {
-        Ok(())
-    } else {
-        Err(nt_status_to_io_error(status))
-    }
+fn write_ads(ads: &Path, data: &[u8]) -> io::Result<()> {
+    open_ads(ads, GENERIC_WRITE, FILE_OVERWRITE_IF)?.write_all(data)
+}
+
+fn ads_exists(ads: &Path) -> bool {
+    open_ads(ads, FILE_READ_ATTRIBUTES, FILE_OPEN).is_ok()
 }
 
 /// Store a security context as an ADS named after `secctx.name`.
-/// When `symlink` is true, opens with `FILE_OPEN_REPARSE_POINT` so the
-/// ADS is placed on the symlink itself rather than following to the target.
-fn write_secctx(path: &Path, secctx: SecContext, symlink: bool) -> io::Result<()> {
+fn write_secctx(path: &Path, secctx: SecContext) -> io::Result<()> {
     let stream_name = format!(":{}", secctx.name.to_string_lossy());
-    let ads = ads_stream_path(path, &stream_name);
-
-    if symlink {
-        write_ads_nofollow(&ads, &secctx.secctx)
-    } else {
-        fs::write(&ads, &secctx.secctx).map_err(win_err_to_linux)
-    }
+    write_ads(&ads_stream_path(path, &stream_name), &secctx.secctx).map_err(win_err_to_linux)
 }
 
 /// Clear suid/sgid bits from mode.
@@ -1732,7 +1709,7 @@ impl PassthroughFs {
             if let Ok((_, _, Some(mode))) = read_override_stat(&path) {
                 let new_mode = clear_suid_sgid(mode);
                 if new_mode != mode
-                    && let Err(e) = write_override_stat(&path, None, Some(new_mode), false)
+                    && let Err(e) = write_override_stat(&path, None, Some(new_mode))
                 {
                     error!("clear suid/sgid for inode {inode}: {e}");
                 }
@@ -2346,7 +2323,7 @@ impl FileSystem for PassthroughFs {
                             current_uid.unwrap_or(u32::MAX),
                             current_gid.unwrap_or(u32::MAX),
                         );
-                        write_override_stat(&path, Some(owner_param), current_mode, false)?;
+                        write_override_stat(&path, Some(owner_param), current_mode)?;
                     }
 
                     // The stream now holds these values, so the reply can
@@ -2542,14 +2519,13 @@ impl FileSystem for PassthroughFs {
 
         if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
             if let Some(secctx) = extensions.secctx {
-                write_secctx(&link_path, secctx, true)?;
+                write_secctx(&link_path, secctx)?;
             }
 
             write_override_stat(
                 &link_path,
                 Some((ctx.uid, ctx.gid)),
                 Some(S_IFLNK as u32 | 0o777),
-                true,
             )?;
         }
 
@@ -2888,7 +2864,7 @@ impl FileSystem for PassthroughFs {
                 let new_mode = clear_suid_sgid(mode);
                 if new_mode != mode {
                     // Update mode in xattr (ADS)
-                    if let Err(err) = write_override_stat(&path, None, Some(new_mode), false) {
+                    if let Err(err) = write_override_stat(&path, None, Some(new_mode)) {
                         error!("Couldn't clear suid/sgid for inode {inode}: {err}");
                     }
                 }
@@ -3026,14 +3002,14 @@ impl FileSystem for PassthroughFs {
         let path = self.inode_path(inode)?;
         let stream = ads_xattr_path(&path, name);
 
-        if flags & XATTR_CREATE != 0 && stream.exists() {
+        if flags & XATTR_CREATE != 0 && ads_exists(&stream) {
             return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EEXIST)));
         }
-        if flags & XATTR_REPLACE != 0 && !stream.exists() {
+        if flags & XATTR_REPLACE != 0 && !ads_exists(&stream) {
             return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::ENODATA)));
         }
 
-        fs::write(&stream, value).map_err(win_err_to_linux)
+        write_ads(&stream, value).map_err(win_err_to_linux)
     }
 
     fn getxattr(
@@ -3064,7 +3040,7 @@ impl FileSystem for PassthroughFs {
         let path = self.inode_path(inode)?;
         let stream = ads_xattr_path(&path, name);
 
-        let data = fs::read(&stream).map_err(|e| {
+        let data = read_ads(&stream).map_err(|e| {
             let code = e.raw_os_error().unwrap_or(0) as u32;
             if code == 2 || code == 3 || code == 123 {
                 // Windows treats ADS as part of the path. If the ADS is missing (2, 3)
@@ -3322,7 +3298,10 @@ impl FileSystem for PassthroughFs {
 mod tests {
     use std::env;
     use std::ffi::CString;
+    use std::os::windows::fs::symlink_file;
     use std::process;
+
+    use windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD;
 
     use super::*;
 
@@ -3707,5 +3686,100 @@ mod tests {
 
         assert_eq!(fs::read(share.root.join("b")).unwrap(), b"victim content");
         assert_eq!(fs::read(verbatim(&share.root.join("b."))).unwrap(), b"");
+    }
+
+    /// Set the owner, the times and an xattr of the symlink `link`, then check each landed on
+    /// the link and left `target`, the entry the link names, as it was.
+    fn a_change_lands_on_the_link(fs: &PassthroughFs, link: Inode, target: &Path) {
+        let target_mtime = fs::metadata(target).unwrap().modified().unwrap();
+
+        let mut owner: stat64 = unsafe { mem::zeroed() };
+        owner.st_uid = 1000;
+        owner.st_gid = 1001;
+        let (st, _) = fs
+            .setattr(
+                CTX,
+                link,
+                owner,
+                None,
+                SetattrValid::UID | SetattrValid::GID,
+            )
+            .unwrap();
+        assert_eq!(st.st_mode & libc::S_IFMT as u32, S_IFLNK as u32);
+        assert_eq!((st.st_uid, st.st_gid), (1000, 1001));
+
+        let mut times: stat64 = unsafe { mem::zeroed() };
+        times.st_mtime = 1_000_000_000;
+        let (st, _) = fs
+            .setattr(CTX, link, times, None, SetattrValid::MTIME)
+            .unwrap();
+        assert_eq!(st.st_mtime, 1_000_000_000);
+
+        fs.setxattr(CTX, link, c"trusted.note", b"on the link", 0)
+            .unwrap();
+        match fs.getxattr(CTX, link, c"trusted.note", 64).unwrap() {
+            GetxattrReply::Value(value) => assert_eq!(value, b"on the link"),
+            GetxattrReply::Count(n) => panic!("asked for the value, got a count of {n}"),
+        }
+        match fs.listxattr(CTX, link, 64).unwrap() {
+            ListxattrReply::Names(names) => assert_eq!(names, b"trusted.note\0"),
+            ListxattrReply::Count(n) => panic!("asked for the names, got a count of {n}"),
+        }
+
+        assert_eq!(ads_list_streams(target).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            fs::metadata(target).unwrap().modified().unwrap(),
+            target_mtime
+        );
+
+        fs.removexattr(CTX, link, c"trusted.note").unwrap();
+        refused(
+            fs.getxattr(CTX, link, c"trusted.note", 64),
+            io::Error::from_raw_os_error(linux_errno_raw(libc::ENODATA)),
+            "a removed xattr was still there",
+        );
+    }
+
+    #[test]
+    fn a_change_to_a_symlink_lands_on_the_link() {
+        let share = Share::new("symlink-change");
+        let fs = share.served();
+        let link = fs
+            .symlink(
+                CTX,
+                c"sub/inside.txt",
+                fuse::ROOT_ID,
+                c"link",
+                Extensions::default(),
+            )
+            .unwrap()
+            .inode;
+
+        a_change_lands_on_the_link(&fs, link, &share.root.join("sub").join("inside.txt"));
+    }
+
+    /// Make `link` in the shared directory an NT symlink to the one file it holds, as the host
+    /// would. Making one needs SeCreateSymbolicLinkPrivilege, so this reports false without it.
+    fn host_symlink(share: &Share) -> bool {
+        match symlink_file("sub\\inside.txt", share.root.join("link")) {
+            Ok(()) => true,
+            Err(e) => {
+                assert_eq!(e.raw_os_error(), Some(ERROR_PRIVILEGE_NOT_HELD as i32));
+                eprintln!("skipped: making an NT symlink needs SeCreateSymbolicLinkPrivilege");
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn a_change_to_a_symlink_the_host_made_lands_on_the_link() {
+        let share = Share::new("host-symlink-change");
+        if !host_symlink(&share) {
+            return;
+        }
+        let fs = share.served();
+        let link = fs.lookup(CTX, fuse::ROOT_ID, c"link").unwrap().inode;
+
+        a_change_lands_on_the_link(&fs, link, &share.root.join("sub").join("inside.txt"));
     }
 }
