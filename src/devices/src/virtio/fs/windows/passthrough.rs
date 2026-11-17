@@ -273,6 +273,32 @@ fn path_to_wide(p: &Path) -> Vec<u16> {
         .collect()
 }
 
+/// Put a path under the `\\?\` prefix that makes Win32 take it verbatim. The shared directory
+/// is stored this way so every path built from it keeps a name literal: Win32 drops the
+/// trailing dots and spaces of a path's last component before the call sees it, so without this
+/// a name ending in either would reach a different entry of the same directory than the one
+/// named -- `rename`, `link`, `setattr` and the ADS streams all reach an entry through Win32.
+/// `path_to_nt_wide` turns this prefix into its `\??\` form, so `lookup` and `create`, which go
+/// through the NT namespace, keep the same name literal. A `/` becomes `\`, as `path_to_nt_wide`
+/// does, since a verbatim path admits no forward slash.
+fn verbatim(path: &Path) -> PathBuf {
+    const SEP: u16 = b'\\' as u16;
+    let prefix = [SEP, SEP, b'?' as u16, SEP];
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .map(|c| if c == b'/' as u16 { SEP } else { c })
+        .collect();
+    if wide.starts_with(&prefix) {
+        PathBuf::from(OsString::from_wide(&wide))
+    } else {
+        let mut prefixed = Vec::with_capacity(prefix.len() + wide.len());
+        prefixed.extend_from_slice(&prefix);
+        prefixed.extend_from_slice(&wide);
+        PathBuf::from(OsString::from_wide(&prefixed))
+    }
+}
+
 fn cstr_to_path(name: &CStr) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(name.to_bytes()).as_ref())
 }
@@ -1911,7 +1937,7 @@ impl FileSystem for PassthroughFs {
     type Handle = Handle;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
-        let root_path = PathBuf::from(&self.cfg.root_dir);
+        let root_path = verbatim(Path::new(&self.cfg.root_dir));
         let file_info = {
             let mut root_h = self.root_handle.write().unwrap();
             // destroy() closes the root handle; a later init() remounts.
@@ -3554,5 +3580,132 @@ mod tests {
             );
         }
         assert_eq!(fs::read(&stream).unwrap(), b"0:0:0644");
+    }
+
+    /// The entry names the host directory holds, as NTFS stores them.
+    fn host_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_rename_onto_a_trailing_dot_name_keeps_the_sibling() {
+        let share = Share::new("rename-to-dot");
+        fs::write(share.root.join("a"), b"from a").unwrap();
+        fs::write(share.root.join("b"), b"from b").unwrap();
+        let fs = share.served();
+
+        fs.rename(CTX, fuse::ROOT_ID, c"a", fuse::ROOT_ID, c"b.", 0)
+            .unwrap();
+
+        assert_eq!(fs::read(share.root.join("b")).unwrap(), b"from b");
+        assert_eq!(
+            fs::read(verbatim(&share.root.join("b."))).unwrap(),
+            b"from a"
+        );
+        assert!(!host_names(&share.root).contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn a_rename_from_a_trailing_dot_name_moves_the_literal_entry() {
+        let share = Share::new("rename-from-dot");
+        fs::write(share.root.join("b"), b"from b").unwrap();
+        fs::write(verbatim(&share.root.join("b.")), b"from b dot").unwrap();
+        let fs = share.served();
+
+        fs.rename(CTX, fuse::ROOT_ID, c"b.", fuse::ROOT_ID, c"c", 0)
+            .unwrap();
+
+        assert_eq!(fs::read(share.root.join("b")).unwrap(), b"from b");
+        assert_eq!(fs::read(share.root.join("c")).unwrap(), b"from b dot");
+        assert!(!host_names(&share.root).contains(&"b.".to_string()));
+    }
+
+    #[test]
+    fn a_noreplace_rename_through_a_trailing_dot_keeps_the_sibling() {
+        let share = Share::new("noreplace-dot");
+        fs::write(share.root.join("a"), b"from a").unwrap();
+        fs::write(share.root.join("b"), b"from b").unwrap();
+        let fs = share.served();
+
+        fs.rename(
+            CTX,
+            fuse::ROOT_ID,
+            c"a",
+            fuse::ROOT_ID,
+            c"b.",
+            LINUX_RENAME_NOREPLACE as u32,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(share.root.join("b")).unwrap(), b"from b");
+        assert_eq!(
+            fs::read(verbatim(&share.root.join("b."))).unwrap(),
+            b"from a"
+        );
+    }
+
+    #[test]
+    fn an_exchange_through_a_trailing_dot_swaps_the_literal_entries() {
+        let share = Share::new("exchange-dot");
+        fs::write(share.root.join("b"), b"victim b").unwrap();
+        fs::write(verbatim(&share.root.join("b.")), b"from b dot").unwrap();
+        fs::write(share.root.join("c"), b"from c").unwrap();
+        let fs = share.served();
+
+        fs.rename(
+            CTX,
+            fuse::ROOT_ID,
+            c"b.",
+            fuse::ROOT_ID,
+            c"c",
+            LINUX_RENAME_EXCHANGE as u32,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(share.root.join("b")).unwrap(), b"victim b");
+        assert_eq!(
+            fs::read(verbatim(&share.root.join("b."))).unwrap(),
+            b"from c"
+        );
+        assert_eq!(fs::read(share.root.join("c")).unwrap(), b"from b dot");
+    }
+
+    #[test]
+    fn a_link_through_a_trailing_dot_name_keeps_the_sibling() {
+        let share = Share::new("link-dot");
+        fs::write(share.root.join("a"), b"from a").unwrap();
+        fs::write(share.root.join("b"), b"from b").unwrap();
+        let fs = share.served();
+        let a = fs.lookup(CTX, fuse::ROOT_ID, c"a").unwrap().inode;
+
+        fs.link(CTX, a, fuse::ROOT_ID, c"b.").unwrap();
+
+        assert_eq!(fs::read(share.root.join("b")).unwrap(), b"from b");
+        assert_eq!(
+            fs::read(verbatim(&share.root.join("b."))).unwrap(),
+            b"from a"
+        );
+    }
+
+    #[test]
+    fn a_truncate_through_a_trailing_dot_inode_keeps_the_sibling() {
+        let share = Share::new("truncate-dot");
+        fs::write(share.root.join("b"), b"victim content").unwrap();
+        fs::write(verbatim(&share.root.join("b.")), b"0123456789").unwrap();
+        let fs = share.served();
+        let dot = fs.lookup(CTX, fuse::ROOT_ID, c"b.").unwrap().inode;
+
+        let mut attr: stat64 = unsafe { std::mem::zeroed() };
+        attr.st_size = 0;
+        fs.setattr(CTX, dot, attr, None, SetattrValid::SIZE)
+            .unwrap();
+
+        assert_eq!(fs::read(share.root.join("b")).unwrap(), b"victim content");
+        assert_eq!(fs::read(verbatim(&share.root.join("b."))).unwrap(), b"");
     }
 }
