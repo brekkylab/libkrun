@@ -14,6 +14,7 @@ use crate::legacy::IrqChip;
 use crate::legacy::gic::GICDevice;
 use arch::aarch64::layout::{GTIMER_HYP, GTIMER_PHYS, GTIMER_SEC, GTIMER_VIRT};
 use arch::{ArchMemoryInfo, InitrdConfig};
+use rand::{TryRng, rngs::SysRng};
 use vm_fdt::{Error as FdtError, FdtWriter};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryError, GuestMemoryMmap};
 
@@ -196,6 +197,13 @@ fn create_chosen_node<T: DeviceInfoForFDT + Clone + Debug>(
 ) -> Result<()> {
     let chosen_node = fdt.begin_node("chosen")?;
     fdt.property_string("bootargs", cmdline)?;
+
+    // Seed the guest's random pool before it boots. Without one, each early get_random_*()
+    // probes for RNDR by reading ID_AA64ISAR0_EL1, a trap to the hypervisor every time.
+    let mut rng_seed = [0u8; 64];
+    if SysRng.try_fill_bytes(&mut rng_seed).is_ok() {
+        fdt.property("rng-seed", &rng_seed)?;
+    }
 
     // If we have a legacy serial device, tell the guest this is the default console.
     // Clever guests will still switch to a better console (like virtio-console) if
