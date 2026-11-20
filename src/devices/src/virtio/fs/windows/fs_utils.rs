@@ -31,6 +31,7 @@ pub fn win_err_to_linux(e: io::Error) -> io::Error {
             1 | 1314 => libc::EPERM, // ERROR_INVALID_FUNCTION / ERROR_PRIVILEGE_NOT_HELD
             6 | 21 => libc::ENXIO,   // ERROR_INVALID_HANDLE / ERROR_NOT_READY
             1117 => libc::EIO,       // ERROR_IO_DEVICE
+            1921 => libc::ELOOP,     // ERROR_CANT_RESOLVE_FILENAME
 
             2 | 3 | 15 | 267 => libc::ENOENT, // ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND / ERROR_INVALID_DRIVE / ERROR_DIRECTORY
             5 => libc::EACCES,                // ERROR_ACCESS_DENIED
